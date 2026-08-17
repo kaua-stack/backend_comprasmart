@@ -1,231 +1,145 @@
 import bcrypt from "bcrypt";
 import userModel from "../models/RegisterModel.js";
-import jwt from "jsonwebtoken";
+
+function publicUser(user) {
+  if (!user) return user;
+
+  const { user_password: _password, ...safeUser } = user;
+  return safeUser;
+}
 
 class RegisterController {
-    async getAllUsers(req, res) {
-        try {
-            const allUsers = await userModel.selectAllUsers();
-
-            if (allUsers.length === 0) {
-                return res.status(404).json({
-                    error: "Nenhum usuário encontrado",
-                });
-            }
-
-            return res.status(200).json(allUsers);
-        } catch (err) {
-            return res.status(500).json({
-                error: "Erro ao buscar usuários",
-            });
-        }
+  async getAllUsers(_req, res) {
+    try {
+      const users = await userModel.selectAllUsers();
+      return res.status(200).json(users.map(publicUser));
+    } catch (error) {
+      console.error("Erro ao buscar usuários:", error);
+      return res.status(500).json({ error: "Erro ao buscar usuários" });
     }
+  }
 
-    async getUserById(req, res) {
-        try {
-            const { user_id } = req.params;
+  async getUserById(req, res) {
+    try {
+      const [user] = await userModel.selectUserById(req.params.user_id);
 
-            const userById = await userModel.selectUserById(user_id);
+      if (!user) {
+        return res.status(404).json({ error: "Usuário não encontrado" });
+      }
 
-           
-
-            if (userById.length === 0) {
-                return res.status(404).json({
-                    error: "Usuário não encontrado!",
-                });
-            }
-
-            return res.status(200).json(userById);
-        } catch (err) {
-            return res.status(500).json({
-                error: "Erro ao buscar usuário!",
-            });
-        }
+      return res.status(200).json(publicUser(user));
+    } catch (error) {
+      console.error("Erro ao buscar usuário:", error);
+      return res.status(500).json({ error: "Erro ao buscar usuário" });
     }
+  }
 
-    async getUserByEmail(req, res) {
-        try {
-            const { user_email } = req.params;
+  async getUserByEmail(req, res) {
+    try {
+      const [user] = await userModel.selectUserByEmail(req.params.user_email);
 
-            const [userByEmail] = await userModel.selectUserByEmail(user_email);
+      if (!user) {
+        return res.status(404).json({ error: "Usuário não encontrado" });
+      }
 
-            if (!userByEmail) {
-                return res.status(404).json({
-                    error: "Usuario não encontrado",
-                });
-            }
-
-            return res.status(200).json(userByEmail);
-        } catch (err) {
-            return res.status(500).json({
-                error: "Erro ao buscar usuário por email!",
-            });
-        }
+      return res.status(200).json(publicUser(user));
+    } catch (error) {
+      console.error("Erro ao buscar usuário por e-mail:", error);
+      return res.status(500).json({ error: "Erro ao buscar usuário por e-mail" });
     }
+  }
 
-    async createUser(req, res) {
-        try {
-            const {
-                user_name,
-                user_email,
-                user_password,
-                
-            } = req.body;
+  async createUser(req, res) {
+    try {
+      const userName = req.body.user_name.trim();
+      const userEmail = req.body.user_email.trim().toLowerCase();
+      const hashedPassword = await bcrypt.hash(req.body.user_password, 12);
 
-            const [existsUser] = await userModel.selectUserByEmail(
-                req.body.user_email
-            );
+      const [existingUser] = await userModel.selectUserByEmail(userEmail);
+      if (existingUser) {
+        return res.status(409).json({ error: "Este e-mail já está cadastrado no sistema" });
+      }
 
-            if (existsUser) {
-                return res.status(400).json({
-                    error: "Este email já está cadastrado no sistema!",
-                });
-            }
+      const result = await userModel.insertUser({
+        user_name: userName,
+        user_email: userEmail,
+        user_password: hashedPassword,
+      });
 
-            const hashedPassword = await bcrypt.hash(user_password, 10);
+      if (result.affectedRows !== 1) {
+        return res.status(500).json({ error: "Não foi possível cadastrar o usuário" });
+      }
 
-            const newUser = await userModel.insertUser({
-                user_name: user_name.trim(),
-                user_email: user_email.trim(),
-                user_password: hashedPassword,
-              
-            });
+      return res.status(201).json({
+        success: "Usuário cadastrado com sucesso",
+        user_id: result.insertId,
+      });
+    } catch (error) {
+      if (error.code === "ER_DUP_ENTRY") {
+        return res.status(409).json({ error: "Este e-mail já está cadastrado no sistema" });
+      }
 
-            if (newUser.affectedRows > 0) {
-                return res.status(200).json({
-                    success: "Usuário cadastrado com sucesso!",
-                });
-            }
-        } catch (error) {
-            return res.status(500).json({
-                error: `Erro ao criar usuário! ${error}`,
-            });
-        }
+      console.error("Erro ao criar usuário:", error);
+      return res.status(500).json({ error: "Erro ao criar usuário" });
     }
+  }
 
-    async updateUser(req, res) {
-        try {
-            const { user_id } = req.params;
-            const {
-                user_name,
-                user_email,
-                user_password,
-            } = req.body;
+  async updateUser(req, res) {
+    try {
+      const { user_id: userId } = req.params;
+      const [currentUser] = await userModel.selectUserById(userId);
 
-            // 1. Verifica se o e-mail já pertence a outro usuário
-            const [existsUser] = await userModel.selectUserByEmail(user_email, user_id);
-            if (existsUser && existsUser.user_id !== Number(user_id)) {
-                return res.status(400).json({
-                    error: "Este email já está cadastrado no sistema!",
-                });
-            }
+      if (!currentUser) {
+        return res.status(404).json({ error: "Usuário não encontrado" });
+      }
 
-            // 2. Busca o usuário atual no banco
-            const [currentUser] = await userModel.selectUserById(user_id);
-            if (!currentUser) {
-                return res.status(404).json({ error: "Usuário não encontrado" });
-            }
+      const userName = req.body.user_name.trim();
+      const userEmail = req.body.user_email.trim().toLowerCase();
+      const [existingUser] = await userModel.selectUserByEmail(userEmail, userId);
 
-            let hashedPassword = currentUser.user_password; // Mantém a senha antiga por padrão
+      if (existingUser) {
+        return res.status(409).json({ error: "Este e-mail já está cadastrado no sistema" });
+      }
 
-            // 3. Se uma NOVA senha foi enviada, faz a lógica de comparação e criptografia
-            if (user_password) {
-                // O bcrypt.compare vai dizer se "1234" corresponde à hash do banco
-                const isSamePassword = await bcrypt.compare(user_password, currentUser.user_password);
+      const userPassword = req.body.user_password
+        ? await bcrypt.hash(req.body.user_password, 12)
+        : currentUser.user_password;
 
-                // SE NÃO FOR A MESMA SENHA: O usuário digitou algo novo. 
-                if (!isSamePassword) {
-                    // Agora gera uma nova hash para a senha nova
-                    hashedPassword = await bcrypt.hash(user_password, 10);
-                }
-            }
+      const result = await userModel.updateUser(userId, {
+        user_name: userName,
+        user_email: userEmail,
+        user_password: userPassword,
+      });
 
-            // 4. Executa a atualização
-            const result = await userModel.updateUser(user_id, {
-                user_name: user_name.trim(),
-                user_email: user_email.trim(),
-                user_password: hashedPassword, // Salva a nova hash ou mantém a antiga
-                
-            });
+      if (result.affectedRows !== 1) {
+        return res.status(400).json({ error: "Nenhuma alteração foi feita" });
+      }
 
-            if (result.affectedRows > 0) {
-                return res.status(200).json({ success: "Usuário atualizado com sucesso!" });
-            } else {
-                return res.status(400).json({ error: "Nenhuma alteração foi feita." });
-            }
+      return res.status(200).json({ success: "Usuário atualizado com sucesso" });
+    } catch (error) {
+      if (error.code === "ER_DUP_ENTRY") {
+        return res.status(409).json({ error: "Este e-mail já está cadastrado no sistema" });
+      }
 
-        } catch (error) {
-            return res.status(500).json({ error: `Erro ao atualizar usuário! ${error.message}` });
-        }
+      console.error("Erro ao atualizar usuário:", error);
+      return res.status(500).json({ error: "Erro ao atualizar usuário" });
     }
+  }
 
-    //-----------------------------------------------------------
-    // async updateUser(req, res) {
-    //     try {
-    //         const { user_id } = req.params;
-    //         const {
-    //             user_name,
-    //             user_email,
-    //             user_password,
-    //             user_phone,
-    //             role_id,
-    //             user_status,
-    //         } = req.body;
+  async deleteUser(req, res) {
+    try {
+      const result = await userModel.deleteUser(req.params.user_id);
 
-    //         const [existsUser] = await userModel.selectUserByEmail(user_email,user_id);
+      if (result.affectedRows !== 1) {
+        return res.status(404).json({ error: "Usuário não encontrado" });
+      }
 
-    //         if (existsUser) {
-    //             return res.status(400).json({
-    //                 error: "Este email já está cadastrado no sistema!",
-    //             });
-    //         }
-
-    //         const existsPassword = await userModel.selectUserById(user_id);
-
-    //         if (existsPassword) {
-    //             const comperingPassword = await bcrypt.compare(
-    //                 user_password,
-    //                 existsPassword.user_password
-    //             );
-    //         }
-
-    //         const hashedPassword = await bcrypt.hash(user_password, 10);
-
-    //         if (comperingPassword) {
-    //             const result = await userModel.updateUser(user_id, {
-    //                 user_name,
-    //                 user_email,
-    //                 user_password: existsPassword.user_password,
-    //                 user_phone,
-    //                 role_id,
-    //                 user_status,
-    //             });
-
-    //             if (result.affectedRows > 0) {
-    //                 return res.status(200).json({ success: "usuario atualizado" });
-    //             }
-    //         }
-    //     } catch (error) {
-    //         return res.status(500).json(`Erro ao criar usuário! ${error}`);
-    //     }
-    // }
-    //-----------------------------------------------------------
-
-
-
-    async deleteUser(req, res) {
-        try {
-            const { user_id } = req.params;
-
-            const result = await userModel.deleteUser(user_id);
-
-            if (result.affectedRows > 0) {
-                return res.status(200).json({ success: "usuario deletado" });
-            }
-        } catch (error) {
-            return res.status(500).json({ error: `Erro ao criar usuário! ${error}` });
-        }
+      return res.status(200).json({ success: "Usuário deletado com sucesso" });
+    } catch (error) {
+      console.error("Erro ao deletar usuário:", error);
+      return res.status(500).json({ error: "Erro ao deletar usuário" });
     }
+  }
 }
 
 export default new RegisterController();

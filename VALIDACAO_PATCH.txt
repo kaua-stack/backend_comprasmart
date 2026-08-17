@@ -1,0 +1,10 @@
+Validação final do patch CompraSmart
+
+- `npm run check`: 5 testes aprovados, 0 falhas.
+- `node --check`: todos os arquivos JavaScript aprovados.
+- `git diff --check`: aprovado, sem erros de whitespace.
+- `git apply --check`: aprovado em uma cópia limpa do repositório.
+- Cópia limpa após `git apply`: `npm ci`, `npm run check` e `node --check` aprovados.
+- Testes HTTP: `/health` retorna 200; preflight permitido retorna 204 com `Access-Control-Allow-Origin` e `Access-Control-Allow-Credentials`; cadastro simulado retorna 201; login simulado retorna access token e cookie `refreshToken`.
+
+Observação: cadastro e login contra um MySQL real exigem um `.env` preenchido e as tabelas `users` e `tokens` descritas em `PATCH_NOTES.md`.

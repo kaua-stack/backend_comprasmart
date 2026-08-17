@@ -1,0 +1,2449 @@
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..f992c97
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,26 @@
++# Servidor
++PORT_SERVER=3000
++NODE_ENV=development
++
++# MySQL
++DB_HOST=localhost
++DB_PORT=3306
++DB_USER=root
++DB_PASSWORD=
++DB_NAME=mercado_scraper
++
++# JWT (use valores longos e aleatórios)
++ACCESS_TOKEN_SECRET=troque-por-um-segredo-de-acesso
++REFRESH_TOKEN_SECRET=troque-por-um-segredo-de-refresh
++ACCESS_TOKEN_EXPIRES_IN=15m
++REFRESH_TOKEN_EXPIRES_IN=7d
++
++# Frontend separado por vírgulas; não use * com credenciais
++CORS_ORIGINS=http://localhost:5173,http://localhost:3000
++
++# Em desenvolvimento local: false/lax. Em HTTPS: true/none.
++COOKIE_SECURE=false
++COOKIE_SAMESITE=lax
++
++# Opcional, somente para login Google
++GOOGLE_CLIENT_ID=
+diff --git a/DIAGNOSTICO_AUTH.md b/DIAGNOSTICO_AUTH.md
+new file mode 100644
+index 0000000..61b3e27
+--- /dev/null
++++ b/DIAGNOSTICO_AUTH.md
+@@ -0,0 +1,20 @@
++# Diagnóstico do backend CompraSmart
++
++## Problemas encontrados
++
++1. O CORS usa `origin: "*"` com `credentials: false`, mas login, refresh e logout dependem de cookie HTTP-only. Em uma aplicação com frontend separado, o navegador precisa de `Access-Control-Allow-Credentials: true` e de uma origem explícita.
++2. `models/RegisterModel.js` é apenas um stub: não implementa `selectUserByEmail`, `insertUser`, `selectUserById`, `selectAllUsers`, `updateUser` nem `deleteUser`. Por isso cadastro e login falham quando os controllers tentam acessar o banco.
++3. O controller de autenticação contém inconsistências de nomes: a função `issueSession` usa `generateTokens`, embora o import seja `generateTokkens`; o fluxo Google usa `userModel`, embora o import seja `usersModel`.
++4. A rotação de refresh token reaproveita somente o ID do usuário, descartando e-mail e função, e configura `cookie.maxAge` com um objeto `Date` em vez de milissegundos.
++5. O logout tenta remover token do banco mesmo quando nenhum cookie foi enviado.
++6. A validação de registro pressupõe que todos os campos sejam strings e o login não possui validação de entrada própria.
++7. O model de tokens está acoplado ao pool, mas o fluxo precisa lidar de forma consistente com cookie, token assinado e usuário existente.
++
++## Escopo do patch
++
++- Configuração de CORS baseada em `CORS_ORIGINS`/`FRONTEND_URL`, com suporte a credenciais e preflight.
++- Model completo de usuários compatível com `mysql2/promise`.
++- Validação de cadastro e login.
++- Emissão, renovação e remoção de sessões com cookies seguros por ambiente.
++- Correção de imports, nomes, respostas HTTP e tratamento de erros.
++- Separação da criação da aplicação (`app.js`) do processo de escuta (`server.js`) para permitir validação automatizada.
+diff --git a/PATCH_NOTES.md b/PATCH_NOTES.md
+new file mode 100644
+index 0000000..103766d
+--- /dev/null
++++ b/PATCH_NOTES.md
+@@ -0,0 +1,80 @@
++# Patch do backend CompraSmart
++
++## Correções aplicadas
++
++O patch corrige o CORS para trabalhar com cookies HTTP-only e credenciais. As origens permitidas são lidas de `CORS_ORIGINS` ou `FRONTEND_URL`, separadas por vírgulas; quando nenhuma variável é definida, são aceitas as portas locais mais comuns. O uso de `origin: "*"` foi removido porque é incompatível com `credentials: true`.
++
++O cadastro e o login agora usam um model MySQL completo. O cadastro valida nome, e-mail e senha, verifica duplicidade, aplica hash bcrypt e responde `201`. O login normaliza o e-mail, compara a senha com bcrypt, emite access token JWT e grava o refresh token no banco e em cookie HTTP-only.
++
++Também foram corrigidos os fluxos de refresh, logout e login Google, o parsing do header Bearer, a rotação dos refresh tokens e a política de cookie em desenvolvimento e produção. A aplicação foi separada em `app.js`, o que permite testes sem iniciar um processo permanente.
++
++## Configuração
++
++Copie `.env.example` para `.env` e preencha os dados reais do MySQL e dois segredos JWT diferentes. Não versionar `.env`.
++
++Em desenvolvimento local, use `COOKIE_SECURE=false` e `COOKIE_SAMESITE=lax`. Em produção com HTTPS, use `COOKIE_SECURE=true` e `COOKIE_SAMESITE=none`. A origem exata do frontend deve estar em `CORS_ORIGINS`, por exemplo `https://comprasmart.example.com`.
++
++O frontend precisa enviar credenciais nas chamadas que usam o cookie de refresh:
++
++```js
++fetch("http://localhost:3000/login", {
++  method: "POST",
++  credentials: "include",
++  headers: { "Content-Type": "application/json" },
++  body: JSON.stringify({
++    user_email: "usuario@example.com",
++    user_password: "Senha@123",
++  }),
++});
++```
++
++Para endpoints protegidos, envie o access token retornado no corpo da resposta:
++
++```http
++Authorization: Bearer <accessToken>
++```
++
++## Endpoints principais
++
++| Método | Endpoint | Uso | Autenticação |
++| --- | --- | --- | --- |
++| `POST` | `/user` | Cadastrar usuário | Não |
++| `POST` | `/login` | Login com e-mail e senha | Não |
++| `POST` | `/refresh` | Renovar access token pelo cookie | Cookie HTTP-only |
++| `POST` | `/logout` | Invalidar refresh token | Cookie HTTP-only |
++| `POST` | `/login/google` | Login Google opcional | Não |
++| `POST` | `/shopping-lists` | Criar uma lista | Bearer |
++| `GET` | `/shopping-lists` | Listar as listas do usuário | Bearer |
++| `GET` | `/shopping-lists/:listId/items` | Consultar itens e preços atuais | Bearer |
++| `POST` | `/shopping-lists/:listId/items` | Adicionar um produto ou item manual | Bearer |
++| `PATCH` | `/shopping-lists/:listId/items/:itemId` | Alterar quantidade, observação ou seleção | Bearer |
++| `DELETE` | `/shopping-lists/:listId/items/:itemId` | Remover item | Bearer |
++| `PATCH` | `/shopping-lists/:listId` | Arquivar ou reabrir lista | Bearer |
++| `GET` | `/health` | Verificar disponibilidade | Não |
++
++Para adicionar um produto já coletado, envie `product_id`; o backend copia para o item o nome, mercado, preço e identificador externo atuais. O campo opcional `comparison_key` permite agrupar o mesmo produto em diferentes mercados. Também é possível criar um item manual usando `product_name` sem `product_id`.
++
++```json
++{
++  "product_id": 123,
++  "comparison_key": "arroz-tipo-1-5kg",
++  "quantity": 2,
++  "notes": "Preferir a menor promoção"
++}
++```
++
++## Schema do banco
++
++O arquivo `sql/mercado_scraper.sql` cria o banco `mercado_scraper` e as tabelas `roles`, `users`, `tokens`, `products`, `shopping_lists` e `shopping_list_items`. A tabela `products` preserva o schema fornecido. A lista pertence ao usuário por `shopping_lists.user_id`; cada item pode apontar para um produto atual por `product_id` e mantém um snapshot com nome, mercado, identificador externo e preço no momento da inclusão. Assim, a lista continua legível mesmo se um produto coletado for removido ou atualizado.
++
++A tabela `users` contém `user_id`, `user_name`, `user_email`, `user_password`, `user_google_id`, `role_id` e `user_status`. A tabela `tokens` armazena o refresh token, a data de expiração e o usuário. As chaves estrangeiras usam exclusão em cascata para tokens e listas quando o usuário é removido, e `ON DELETE SET NULL` para preservar o item da lista quando o produto original deixar de existir.
++
++## Configuração do banco
++
++Copie `.env.example` para `.env`, confirme `DB_NAME=mercado_scraper` e execute o SQL com, por exemplo, `mysql -u root -p < sql/mercado_scraper.sql`. Depois reinicie o backend. O script usa `CREATE DATABASE IF NOT EXISTS`, `CREATE TABLE IF NOT EXISTS` e `INSERT IGNORE` para roles padrão, podendo ser executado mais de uma vez em uma instalação nova.
++
++## Validação executada
++
++`npm run check` foi executado com cinco testes aprovados: health check, preflight CORS permitido com credenciais, rejeição de login sem campos obrigatórios, emissão/verificação de JWT e fluxo HTTP simulado de cadastro/login com access token e cookie. Também foi executado `node --check` em todos os arquivos JavaScript.
++
++A validação contra cadastro, login e listas em um MySQL real depende de um servidor acessível e de credenciais locais; o arquivo SQL entregue contém o schema necessário para essa execução.
+diff --git a/VALIDACAO_PATCH.txt b/VALIDACAO_PATCH.txt
+new file mode 100644
+index 0000000..6480618
+--- /dev/null
++++ b/VALIDACAO_PATCH.txt
+@@ -0,0 +1,10 @@
++Validação final do schema e do backend CompraSmart
++
++- `npm run check`: 7 testes aprovados, 0 falhas.
++- `node --check`: todos os arquivos JavaScript aprovados.
++- `git diff --check`: aprovado, sem erros de whitespace.
++- Teste estrutural do SQL: banco, roles, usuários, tokens, produtos, listas, itens e chaves estrangeiras presentes.
++- Testes HTTP simulados: `/health` retorna 200; preflight permitido retorna 204 com CORS e credenciais; cadastro retorna 201; login retorna access token e cookie `refreshToken`; lista exige Bearer e aceita item.
++- O cliente MySQL está disponível, mas não há servidor MySQL local em execução; o schema não foi executado contra um banco real neste ambiente.
++
++Para execução real, copie `.env.example` para `.env`, preencha as credenciais e execute `mysql -u root -p < sql/mercado_scraper.sql`.
+diff --git a/app.js b/app.js
+new file mode 100644
+index 0000000..0097e03
+--- /dev/null
++++ b/app.js
+@@ -0,0 +1,69 @@
++import express from "express";
++import cors from "cors";
++import cookieParser from "cookie-parser";
++import dotenv from "dotenv";
++
++import userRoute from "./routes/RegisterRouter.js";
++import loginRoute from "./routes/LoginRoutes.js";
++import shoppingListRoute from "./routes/ShoppingListRoutes.js";
++
++dotenv.config();
++
++const defaultOrigins = [
++  "http://localhost:3000",
++  "http://localhost:5173",
++  "http://localhost:4173",
++  "http://127.0.0.1:3000",
++  "http://127.0.0.1:5173",
++  "http://127.0.0.1:4173",
++];
++
++const configuredOrigins = (process.env.CORS_ORIGINS || process.env.FRONTEND_URL || "")
++  .split(",")
++  .map((origin) => origin.trim())
++  .filter(Boolean);
++
++const allowedOrigins = configuredOrigins.length > 0 ? configuredOrigins : defaultOrigins;
++
++export const corsOptions = {
++  origin(origin, callback) {
++    // Permite chamadas sem header Origin, como curl, testes e aplicações server-to-server.
++    if (!origin || allowedOrigins.includes(origin)) {
++      return callback(null, true);
++    }
++
++    return callback(new Error(`Origem não autorizada pelo CORS: ${origin}`));
++  },
++  credentials: true,
++  methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
++  allowedHeaders: ["Content-Type", "Authorization"],
++  exposedHeaders: ["Set-Cookie"],
++  optionsSuccessStatus: 204,
++};
++
++const app = express();
++
++app.disable("x-powered-by");
++app.use(cors(corsOptions));
++app.options(/.*/, cors(corsOptions));
++app.use(express.json({ limit: "1mb" }));
++app.use(cookieParser());
++
++app.get("/health", (_req, res) => {
++  res.status(200).json({ status: "ok" });
++});
++
++app.use("/user", userRoute);
++app.use(loginRoute);
++app.use("/shopping-lists", shoppingListRoute);
++
++app.use((error, _req, res, _next) => {
++  if (error?.message?.startsWith("Origem não autorizada pelo CORS:")) {
++    return res.status(403).json({ error: error.message });
++  }
++
++  console.error(error);
++  return res.status(500).json({ error: "Erro interno do servidor" });
++});
++
++export default app;
+diff --git a/controllers/RegisterController.js b/controllers/RegisterController.js
+index b18a43b..29c2950 100644
+--- a/controllers/RegisterController.js
++++ b/controllers/RegisterController.js
+@@ -1,231 +1,145 @@
+ import bcrypt from "bcrypt";
+ import userModel from "../models/RegisterModel.js";
+-import jwt from "jsonwebtoken";
+ 
+-class RegisterController {
+-    async getAllUsers(req, res) {
+-        try {
+-            const allUsers = await userModel.selectAllUsers();
+-
+-            if (allUsers.length === 0) {
+-                return res.status(404).json({
+-                    error: "Nenhum usuário encontrado",
+-                });
+-            }
+-
+-            return res.status(200).json(allUsers);
+-        } catch (err) {
+-            return res.status(500).json({
+-                error: "Erro ao buscar usuários",
+-            });
+-        }
+-    }
++function publicUser(user) {
++  if (!user) return user;
+ 
+-    async getUserById(req, res) {
+-        try {
+-            const { user_id } = req.params;
++  const { user_password: _password, ...safeUser } = user;
++  return safeUser;
++}
+ 
+-            const userById = await userModel.selectUserById(user_id);
++class RegisterController {
++  async getAllUsers(_req, res) {
++    try {
++      const users = await userModel.selectAllUsers();
++      return res.status(200).json(users.map(publicUser));
++    } catch (error) {
++      console.error("Erro ao buscar usuários:", error);
++      return res.status(500).json({ error: "Erro ao buscar usuários" });
++    }
++  }
+ 
+-           
++  async getUserById(req, res) {
++    try {
++      const [user] = await userModel.selectUserById(req.params.user_id);
+ 
+-            if (userById.length === 0) {
+-                return res.status(404).json({
+-                    error: "Usuário não encontrado!",
+-                });
+-            }
++      if (!user) {
++        return res.status(404).json({ error: "Usuário não encontrado" });
++      }
+ 
+-            return res.status(200).json(userById);
+-        } catch (err) {
+-            return res.status(500).json({
+-                error: "Erro ao buscar usuário!",
+-            });
+-        }
++      return res.status(200).json(publicUser(user));
++    } catch (error) {
++      console.error("Erro ao buscar usuário:", error);
++      return res.status(500).json({ error: "Erro ao buscar usuário" });
+     }
++  }
+ 
+-    async getUserByEmail(req, res) {
+-        try {
+-            const { user_email } = req.params;
++  async getUserByEmail(req, res) {
++    try {
++      const [user] = await userModel.selectUserByEmail(req.params.user_email);
+ 
+-            const [userByEmail] = await userModel.selectUserByEmail(user_email);
++      if (!user) {
++        return res.status(404).json({ error: "Usuário não encontrado" });
++      }
+ 
+-            if (!userByEmail) {
+-                return res.status(404).json({
+-                    error: "Usuario não encontrado",
+-                });
+-            }
+-
+-            return res.status(200).json(userByEmail);
+-        } catch (err) {
+-            return res.status(500).json({
+-                error: "Erro ao buscar usuário por email!",
+-            });
+-        }
++      return res.status(200).json(publicUser(user));
++    } catch (error) {
++      console.error("Erro ao buscar usuário por e-mail:", error);
++      return res.status(500).json({ error: "Erro ao buscar usuário por e-mail" });
+     }
+-
+-    async createUser(req, res) {
+-        try {
+-            const {
+-                user_name,
+-                user_email,
+-                user_password,
+-                
+-            } = req.body;
+-
+-            const [existsUser] = await userModel.selectUserByEmail(
+-                req.body.user_email
+-            );
+-
+-            if (existsUser) {
+-                return res.status(400).json({
+-                    error: "Este email já está cadastrado no sistema!",
+-                });
+-            }
+-
+-            const hashedPassword = await bcrypt.hash(user_password, 10);
+-
+-            const newUser = await userModel.insertUser({
+-                user_name: user_name.trim(),
+-                user_email: user_email.trim(),
+-                user_password: hashedPassword,
+-              
+-            });
+-
+-            if (newUser.affectedRows > 0) {
+-                return res.status(200).json({
+-                    success: "Usuário cadastrado com sucesso!",
+-                });
+-            }
+-        } catch (error) {
+-            return res.status(500).json({
+-                error: `Erro ao criar usuário! ${error}`,
+-            });
+-        }
++  }
++
++  async createUser(req, res) {
++    try {
++      const userName = req.body.user_name.trim();
++      const userEmail = req.body.user_email.trim().toLowerCase();
++      const hashedPassword = await bcrypt.hash(req.body.user_password, 12);
++
++      const [existingUser] = await userModel.selectUserByEmail(userEmail);
++      if (existingUser) {
++        return res.status(409).json({ error: "Este e-mail já está cadastrado no sistema" });
++      }
++
++      const result = await userModel.insertUser({
++        user_name: userName,
++        user_email: userEmail,
++        user_password: hashedPassword,
++      });
++
++      if (result.affectedRows !== 1) {
++        return res.status(500).json({ error: "Não foi possível cadastrar o usuário" });
++      }
++
++      return res.status(201).json({
++        success: "Usuário cadastrado com sucesso",
++        user_id: result.insertId,
++      });
++    } catch (error) {
++      if (error.code === "ER_DUP_ENTRY") {
++        return res.status(409).json({ error: "Este e-mail já está cadastrado no sistema" });
++      }
++
++      console.error("Erro ao criar usuário:", error);
++      return res.status(500).json({ error: "Erro ao criar usuário" });
+     }
+-
+-    async updateUser(req, res) {
+-        try {
+-            const { user_id } = req.params;
+-            const {
+-                user_name,
+-                user_email,
+-                user_password,
+-            } = req.body;
+-
+-            // 1. Verifica se o e-mail já pertence a outro usuário
+-            const [existsUser] = await userModel.selectUserByEmail(user_email, user_id);
+-            if (existsUser && existsUser.user_id !== Number(user_id)) {
+-                return res.status(400).json({
+-                    error: "Este email já está cadastrado no sistema!",
+-                });
+-            }
+-
+-            // 2. Busca o usuário atual no banco
+-            const [currentUser] = await userModel.selectUserById(user_id);
+-            if (!currentUser) {
+-                return res.status(404).json({ error: "Usuário não encontrado" });
+-            }
+-
+-            let hashedPassword = currentUser.user_password; // Mantém a senha antiga por padrão
+-
+-            // 3. Se uma NOVA senha foi enviada, faz a lógica de comparação e criptografia
+-            if (user_password) {
+-                // O bcrypt.compare vai dizer se "1234" corresponde à hash do banco
+-                const isSamePassword = await bcrypt.compare(user_password, currentUser.user_password);
+-
+-                // SE NÃO FOR A MESMA SENHA: O usuário digitou algo novo. 
+-                if (!isSamePassword) {
+-                    // Agora gera uma nova hash para a senha nova
+-                    hashedPassword = await bcrypt.hash(user_password, 10);
+-                }
+-            }
+-
+-            // 4. Executa a atualização
+-            const result = await userModel.updateUser(user_id, {
+-                user_name: user_name.trim(),
+-                user_email: user_email.trim(),
+-                user_password: hashedPassword, // Salva a nova hash ou mantém a antiga
+-                
+-            });
+-
+-            if (result.affectedRows > 0) {
+-                return res.status(200).json({ success: "Usuário atualizado com sucesso!" });
+-            } else {
+-                return res.status(400).json({ error: "Nenhuma alteração foi feita." });
+-            }
+-
+-        } catch (error) {
+-            return res.status(500).json({ error: `Erro ao atualizar usuário! ${error.message}` });
+-        }
++  }
++
++  async updateUser(req, res) {
++    try {
++      const { user_id: userId } = req.params;
++      const [currentUser] = await userModel.selectUserById(userId);
++
++      if (!currentUser) {
++        return res.status(404).json({ error: "Usuário não encontrado" });
++      }
++
++      const userName = req.body.user_name.trim();
++      const userEmail = req.body.user_email.trim().toLowerCase();
++      const [existingUser] = await userModel.selectUserByEmail(userEmail, userId);
++
++      if (existingUser) {
++        return res.status(409).json({ error: "Este e-mail já está cadastrado no sistema" });
++      }
++
++      const userPassword = req.body.user_password
++        ? await bcrypt.hash(req.body.user_password, 12)
++        : currentUser.user_password;
++
++      const result = await userModel.updateUser(userId, {
++        user_name: userName,
++        user_email: userEmail,
++        user_password: userPassword,
++      });
++
++      if (result.affectedRows !== 1) {
++        return res.status(400).json({ error: "Nenhuma alteração foi feita" });
++      }
++
++      return res.status(200).json({ success: "Usuário atualizado com sucesso" });
++    } catch (error) {
++      if (error.code === "ER_DUP_ENTRY") {
++        return res.status(409).json({ error: "Este e-mail já está cadastrado no sistema" });
++      }
++
++      console.error("Erro ao atualizar usuário:", error);
++      return res.status(500).json({ error: "Erro ao atualizar usuário" });
+     }
++  }
++
++  async deleteUser(req, res) {
++    try {
++      const result = await userModel.deleteUser(req.params.user_id);
++
++      if (result.affectedRows !== 1) {
++        return res.status(404).json({ error: "Usuário não encontrado" });
++      }
+ 
+-    //-----------------------------------------------------------
+-    // async updateUser(req, res) {
+-    //     try {
+-    //         const { user_id } = req.params;
+-    //         const {
+-    //             user_name,
+-    //             user_email,
+-    //             user_password,
+-    //             user_phone,
+-    //             role_id,
+-    //             user_status,
+-    //         } = req.body;
+-
+-    //         const [existsUser] = await userModel.selectUserByEmail(user_email,user_id);
+-
+-    //         if (existsUser) {
+-    //             return res.status(400).json({
+-    //                 error: "Este email já está cadastrado no sistema!",
+-    //             });
+-    //         }
+-
+-    //         const existsPassword = await userModel.selectUserById(user_id);
+-
+-    //         if (existsPassword) {
+-    //             const comperingPassword = await bcrypt.compare(
+-    //                 user_password,
+-    //                 existsPassword.user_password
+-    //             );
+-    //         }
+-
+-    //         const hashedPassword = await bcrypt.hash(user_password, 10);
+-
+-    //         if (comperingPassword) {
+-    //             const result = await userModel.updateUser(user_id, {
+-    //                 user_name,
+-    //                 user_email,
+-    //                 user_password: existsPassword.user_password,
+-    //                 user_phone,
+-    //                 role_id,
+-    //                 user_status,
+-    //             });
+-
+-    //             if (result.affectedRows > 0) {
+-    //                 return res.status(200).json({ success: "usuario atualizado" });
+-    //             }
+-    //         }
+-    //     } catch (error) {
+-    //         return res.status(500).json(`Erro ao criar usuário! ${error}`);
+-    //     }
+-    // }
+-    //-----------------------------------------------------------
+-
+-
+-
+-    async deleteUser(req, res) {
+-        try {
+-            const { user_id } = req.params;
+-
+-            const result = await userModel.deleteUser(user_id);
+-
+-            if (result.affectedRows > 0) {
+-                return res.status(200).json({ success: "usuario deletado" });
+-            }
+-        } catch (error) {
+-            return res.status(500).json({ error: `Erro ao criar usuário! ${error}` });
+-        }
++      return res.status(200).json({ success: "Usuário deletado com sucesso" });
++    } catch (error) {
++      console.error("Erro ao deletar usuário:", error);
++      return res.status(500).json({ error: "Erro ao deletar usuário" });
+     }
++  }
+ }
+ 
+ export default new RegisterController();
+diff --git a/controllers/ShoppingListController.js b/controllers/ShoppingListController.js
+new file mode 100644
+index 0000000..719d984
+--- /dev/null
++++ b/controllers/ShoppingListController.js
+@@ -0,0 +1,145 @@
++import shoppingListModel from "../models/ShoppingListModel.js";
++
++function userIdFromRequest(req) {
++  return Number(req.user?.id);
++}
++
++function validId(value) {
++  const id = Number(value);
++  return Number.isSafeInteger(id) && id > 0 ? id : null;
++}
++
++class ShoppingListController {
++  async createList(req, res) {
++    const userId = userIdFromRequest(req);
++    const listName = req.body?.list_name;
++
++    if (!Number.isSafeInteger(userId) || (listName !== undefined && typeof listName !== "string")) {
++      return res.status(400).json({ error: "Nome da lista inválido" });
++    }
++
++    try {
++      const result = await shoppingListModel.createList(userId, listName);
++      return res.status(201).json({
++        list_id: result.insertId,
++        list_name: typeof listName === "string" && listName.trim() ? listName.trim() : "Minha lista",
++      });
++    } catch (error) {
++      if (error.code === "ER_DUP_ENTRY") {
++        return res.status(409).json({ error: "Você já possui uma lista com esse nome" });
++      }
++
++      console.error("Erro ao criar lista:", error);
++      return res.status(500).json({ error: "Erro ao criar lista" });
++    }
++  }
++
++  async getLists(req, res) {
++    try {
++      const lists = await shoppingListModel.selectListsByUser(userIdFromRequest(req));
++      return res.status(200).json(lists);
++    } catch (error) {
++      console.error("Erro ao buscar listas:", error);
++      return res.status(500).json({ error: "Erro ao buscar listas" });
++    }
++  }
++
++  async getItems(req, res) {
++    const listId = validId(req.params.listId);
++    if (!listId) return res.status(400).json({ error: "ID da lista inválido" });
++
++    try {
++      const list = await shoppingListModel.selectListById(userIdFromRequest(req), listId);
++      if (!list) return res.status(404).json({ error: "Lista não encontrada" });
++
++      const items = await shoppingListModel.selectItems(userIdFromRequest(req), listId);
++      return res.status(200).json({ list, items });
++    } catch (error) {
++      console.error("Erro ao buscar itens da lista:", error);
++      return res.status(500).json({ error: "Erro ao buscar itens da lista" });
++    }
++  }
++
++  async addItem(req, res) {
++    const listId = validId(req.params.listId);
++    const body = req.body && typeof req.body === "object" ? req.body : {};
++
++    if (!listId) return res.status(400).json({ error: "ID da lista inválido" });
++    if (body.quantity !== undefined && (!Number.isFinite(Number(body.quantity)) || Number(body.quantity) <= 0)) {
++      return res.status(400).json({ error: "A quantidade deve ser maior que zero" });
++    }
++
++    try {
++      const result = await shoppingListModel.addItem(userIdFromRequest(req), listId, body);
++      if (result.error === "LIST_NOT_FOUND") return res.status(404).json({ error: "Lista não encontrada" });
++      if (result.error === "PRODUCT_NOT_FOUND") return res.status(404).json({ error: "Produto não encontrado" });
++      if (result.error === "PRODUCT_NAME_REQUIRED") return res.status(400).json({ error: "Informe product_id ou product_name" });
++
++      return res.status(201).json({ item_id: result.result.insertId });
++    } catch (error) {
++      console.error("Erro ao adicionar item:", error);
++      return res.status(500).json({ error: "Erro ao adicionar item na lista" });
++    }
++  }
++
++  async updateItem(req, res) {
++    const listId = validId(req.params.listId);
++    const itemId = validId(req.params.itemId);
++
++    if (!listId || !itemId) return res.status(400).json({ error: "ID da lista ou do item inválido" });
++
++    try {
++      const result = await shoppingListModel.updateItem(
++        userIdFromRequest(req),
++        listId,
++        itemId,
++        req.body && typeof req.body === "object" ? req.body : {},
++      );
++
++      if (result.affectedRows !== 1) {
++        return res.status(404).json({ error: "Item não encontrado ou nenhuma alteração foi feita" });
++      }
++
++      return res.status(200).json({ success: "Item atualizado" });
++    } catch (error) {
++      console.error("Erro ao atualizar item:", error);
++      return res.status(500).json({ error: "Erro ao atualizar item" });
++    }
++  }
++
++  async deleteItem(req, res) {
++    const listId = validId(req.params.listId);
++    const itemId = validId(req.params.itemId);
++
++    if (!listId || !itemId) return res.status(400).json({ error: "ID da lista ou do item inválido" });
++
++    try {
++      const result = await shoppingListModel.deleteItem(userIdFromRequest(req), listId, itemId);
++      if (result.affectedRows !== 1) return res.status(404).json({ error: "Item não encontrado" });
++      return res.status(200).json({ success: "Item removido da lista" });
++    } catch (error) {
++      console.error("Erro ao remover item:", error);
++      return res.status(500).json({ error: "Erro ao remover item" });
++    }
++  }
++
++  async archiveList(req, res) {
++    const listId = validId(req.params.listId);
++    if (!listId) return res.status(400).json({ error: "ID da lista inválido" });
++
++    try {
++      const result = await shoppingListModel.archiveList(
++        userIdFromRequest(req),
++        listId,
++        req.body?.is_archived !== false,
++      );
++      if (result.affectedRows !== 1) return res.status(404).json({ error: "Lista não encontrada" });
++      return res.status(200).json({ success: "Lista atualizada" });
++    } catch (error) {
++      console.error("Erro ao arquivar lista:", error);
++      return res.status(500).json({ error: "Erro ao atualizar lista" });
++    }
++  }
++}
++
++export default new ShoppingListController();
+diff --git a/controllers/authLoginController.js b/controllers/authLoginController.js
+index a8a76f8..4bb79a5 100644
+--- a/controllers/authLoginController.js
++++ b/controllers/authLoginController.js
+@@ -1,307 +1,200 @@
+ import bcrypt from "bcrypt";
+-import generateTokkens from "../utils/generateTokken.js";
+-import usersModel from "../models/RegisterModel.js";
+-import tokenModel from "../models/tokenModel.js";
+-import { OAuth2Client } from "google-auth-library";
+ import dotenv from "dotenv";
+ import jwt from "jsonwebtoken";
+- 
++import { OAuth2Client } from "google-auth-library";
++
++import generateTokens from "../utils/generateTokken.js";
++import usersModel from "../models/RegisterModel.js";
++import tokenModel from "../models/tokenModel.js";
++
+ dotenv.config();
++
++const REFRESH_TOKEN_MAX_AGE = 7 * 24 * 60 * 60 * 1000;
+ const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+ const DEFAULT_GOOGLE_ROLE_ID = 1;
+- 
++
++function refreshCookieOptions() {
++  const secure = process.env.COOKIE_SECURE === "true" || process.env.NODE_ENV === "production";
++  const configuredSameSite = (process.env.COOKIE_SAMESITE || "").toLowerCase();
++  const requestedSameSite = configuredSameSite || (secure ? "none" : "lax");
++  const sameSite = requestedSameSite === "none" && !secure ? "lax" : requestedSameSite;
++
++  return {
++    httpOnly: true,
++    secure,
++    sameSite,
++    path: "/",
++    maxAge: REFRESH_TOKEN_MAX_AGE,
++  };
++}
++
++function clearRefreshCookie(res) {
++  const { maxAge: _maxAge, ...options } = refreshCookieOptions();
++  res.clearCookie("refreshToken", options);
++}
++
+ async function issueSession(res, user) {
+-    const accessToken = generateTokens.generateAccessToken(user);
+-    const refreshToken = generateTokens.generateRefreshToken(user);
+- 
+-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // +7 dias
+- 
+-    const savedToken = await tokenModel.createToken({
+-        user_id: user.user_id,
+-        token: refreshToken,
+-        expires_at: expiresAt,
+-    });
+- 
+-    if (savedToken.affectedRows === 0) {
+-        return null;
+-    }
+- 
+-    res.cookie("refreshToken", refreshToken, {
+-        httpOnly: true,
+-        // secure: process.env.COOKIE_SECRET,
+-        secure: false,
+-        sameSite: "strict",
+-        maxAge: 604800000,
+-    });
+- 
+-    return accessToken;
++  const accessToken = generateTokens.generateAccessToken(user);
++  const refreshToken = generateTokens.generateRefreshToken(user);
++  const expiresAt = new Date(Date.now() + REFRESH_TOKEN_MAX_AGE);
++
++  const savedToken = await tokenModel.createToken({
++    user_id: user.user_id,
++    token: refreshToken,
++    expires_at: expiresAt,
++  });
++
++  if (savedToken.affectedRows !== 1) {
++    throw new Error("Não foi possível salvar o token de refresh");
++  }
++
++  res.cookie("refreshToken", refreshToken, refreshCookieOptions());
++  return accessToken;
+ }
+- 
+- 
++
+ class AuthLoginController {
+-    async login(req, res) {
+-        try {
+-            const { user_email, user_password } = req.body;
+-            const [emailExists] = await usersModel.selectUserByEmail(user_email)
+-            if (!emailExists) {
+-                return res.status(400).json({ error: "Email ou senha invalido!" });
+-            }
+- 
+-            //compara a senha digitada com a senha criptografada no banco de dados, usando o bcrypt para fazer a comparação
+-            const validyPassword = await bcrypt.compare(user_password, emailExists.user_password);
+- 
+-            if (!validyPassword) {
+-                return res.status(400).json({ error: "Email ou senha invalido!" });
+-            }
+- 
+-            //gerar o token de acesso e o token de refresh, usando a função generateAccessToken e generateRefreshToken do arquivo generateTokkens.js
+-            const accessToken = generateTokkens.generateAccessToken(emailExists);
+-            const refreshToken = generateTokkens.generateRefreshToken(emailExists);
+- 
+-            const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // Expira em 7 dias para alterar o tempo de expiração do token de refresh, basta alterar o valor multiplicado por 7 (dias), 24 (horas), 60 (minutos), 60 (segundos) e 1000 (milissegundos)
+- 
+-            const savedToken = await tokenModel.createToken({
+-                user_id: emailExists.user_id,
+-                token: refreshToken,
+-                expires_at: expiresAt
+-            });
+- 
+-            if (savedToken.affectedRows === 0) {
+-                return res.status(500).json({ error: "Erro ao salvar token de refresh!" });
+-            }
+- 
+-            //primeiro parametro passado é o nome do cookie, o segundo é o valor do cookie, e o terceiro são as configurações do cookie, como httpOnly, secure, etc. (opcional)
+-            res.cookie("refreshToken", refreshToken, {
+-                httpOnly: true, // O cookie só pode ser acessado pelo servidor, não pelo JavaScript do cliente
+-                // o resultado desse secure vai vir como false algo necessario para rodar na maquina local
+-                secure: false,//process.env.COOKIE_ENV === "production", // O cookie só será enviado em conexões seguras (HTTPS) no ambiente de produção
+-                //a versão abaixo funciona somente em https impedindo acessos http
+-                //secure: process.env.COOKIE_ENV,
+-                sameSite: "strict", // O cookie só será enviado para o mesmo site, prevenindo ataques CSRF
+-                maxAge: 7 * 24 * 60 * 60 * 1000, // O cookie expira em 7 dias
+-            });
+- 
+-            return res.json({ success: "Login bem-sucedido!", accessToken: accessToken });
+-        } catch (error) {
+-            res.status(500).json({ error: `Erro ao realizar login! ${error.message}` });
+-        }
+- 
++  async login(req, res) {
++    try {
++      const userEmail = req.body.user_email.trim().toLowerCase();
++      const userPassword = req.body.user_password;
++      const [user] = await usersModel.selectUserByEmail(userEmail);
++
++      if (!user || user.user_status === 0) {
++        return res.status(401).json({ error: "E-mail ou senha inválidos" });
++      }
++
++      const passwordIsValid = Boolean(user.user_password)
++        && await bcrypt.compare(userPassword, user.user_password);
++      if (!passwordIsValid) {
++        return res.status(401).json({ error: "E-mail ou senha inválidos" });
++      }
++
++      const accessToken = await issueSession(res, user);
++      return res.status(200).json({
++        success: "Login bem-sucedido",
++        accessToken,
++      });
++    } catch (error) {
++      console.error("Erro ao realizar login:", error);
++      return res.status(500).json({ error: "Erro ao realizar login" });
+     }
+-    async googleLogin(req, res) {
+-            const { credential } = req.body;
+-   
+-            if (!credential) {
+-                return res.status(400).json({
+-                    error: "Credencial do Google não fornecida!",
+-                });
+-            }
+-   
+-            let payload;
+-   
+-            try {
+-                const ticket = await googleClient.verifyIdToken({
+-                    idToken: credential,
+-                    audience: process.env.GOOGLE_CLIENT_ID,
+-                });
+-   
+-                payload = ticket.getPayload();
+-            } catch (error) {
+-                return res.status(401).json({
+-                    error: "Token do Google inválido!",
+-                });
+-            }
+-   
+-            if (!payload?.email_verified) {
+-                return res.status(401).json({
+-                    error: "Email do Google não verificado!",
+-                });
+-            }
+-   
+-            const { sub: googleId, email, name } = payload;
+-   
+-            let [user] = await userModel.selectUserByGoogleId(googleId);
+-   
+-            if (!user) {
+-                const [userByEmail] = await userModel.selectUserByEmail(email);
+-   
+-                if (userByEmail) {
+-                    await userModel.linkGoogleAccount(userByEmail.user_id, googleId);
+-                    user = userByEmail;
+-                } else {
+-                    const newUser = await userModel.insertGoogleUser({
+-                        user_name: name,
+-                        user_email: email,
+-                        user_google_id: googleId,
+-                        role_id: DEFAULT_GOOGLE_ROLE_ID,
+-                        user_status: 1,
+-                    });
+-   
+-                    if (newUser.affectedRows === 0) {
+-                        return res.status(500).json({
+-                            error: "Erro ao cadastrar usuário via Google!",
+-                        });
+-                    }
+-   
+-                    [user] = await userModel.selectUserByGoogleId(googleId);
+-                }
+-            }
+-   
+-            const accessToken = await issueSession(res, user);
+-   
+-            if (!accessToken) {
+-                return res.status(500).json({
+-                    error: "Erro ao criar token!",
+-                });
+-            }
+-   
+-            return res.json({
+-                success: "Login com Google realizado com sucesso!",
+-                accessToken,
+-            });
+-        }
+- 
+-    async refreshToken(req, res) {
+-        const rfToken = req.cookies?.refreshToken;
+-        console.log(rfToken);
+- 
+-        if (!rfToken) {
+-            return res.status(401).json({ error: "Token de refresh não encontrado!" });
+-        }
+- 
+-        const [tokenExists] = await tokenModel.selectByToken(rfToken);
+-        console.log(tokenExists);
+- 
+- 
+-        if (!tokenExists) {
+-            return res.status(401).json({ error: "Token invalido!" })
++  }
++
++  async googleLogin(req, res) {
++    try {
++      if (!process.env.GOOGLE_CLIENT_ID) {
++        return res.status(503).json({ error: "Login com Google não configurado" });
++      }
++
++      const { credential } = req.body;
++      if (!credential) {
++        return res.status(400).json({ error: "Credencial do Google não fornecida" });
++      }
++
++      const ticket = await googleClient.verifyIdToken({
++        idToken: credential,
++        audience: process.env.GOOGLE_CLIENT_ID,
++      });
++      const payload = ticket.getPayload();
++
++      if (!payload?.email_verified) {
++        return res.status(401).json({ error: "E-mail do Google não verificado" });
++      }
++
++      const { sub: googleId, email, name } = payload;
++      let [user] = await usersModel.selectUserByGoogleId(googleId);
++
++      if (!user) {
++        const [userByEmail] = await usersModel.selectUserByEmail(email);
++
++        if (userByEmail) {
++          await usersModel.linkGoogleAccount(userByEmail.user_id, googleId);
++          user = { ...userByEmail, user_google_id: googleId };
++        } else {
++          const newUser = await usersModel.insertGoogleUser({
++            user_name: name || email.split("@")[0],
++            user_email: email.toLowerCase(),
++            user_google_id: googleId,
++            role_id: DEFAULT_GOOGLE_ROLE_ID,
++            user_status: 1,
++          });
++
++          if (newUser.affectedRows !== 1) {
++            return res.status(500).json({ error: "Erro ao cadastrar usuário via Google" });
++          }
++
++          [user] = await usersModel.selectUserByGoogleId(googleId);
+         }
+- 
+-        jwt.verify(rfToken, process.env.REFRESH_TOKEN_SECRET, async (error, usuarioDecodificado) => {
+-            if (error) {
+-                return res.status(403).json({ error: "Token invalido ou expirado. " + error.message })
+-            }
+- 
+-            await tokenModel.deleteToken(rfToken);
+- 
+-            const { iat, exp, ...userData } = usuarioDecodificado
+- 
+-            const accessToken = generateTokkens.generateAccessToken(userData);
+-            const newRefreshToken = generateTokkens.generateRefreshToken(userData);
+-            console.log(newRefreshToken);
+- 
+-            const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+- 
+-            const savedToken = await tokenModel.createToken({
+-                user_id: userData.id,
+-                token: newRefreshToken,
+-                expires_at: expiresAt
+-            });
+-            if (savedToken.affectedRows === 0) {
+-                return res.status(500).json({
+-                    error: "Erro ao cadastrar o token!",
+-                });
+-            }
+- 
+-            res.cookie("refreshToken", newRefreshToken, {
+-                httpOnly: true,
+-                secure: false,
+-                sameSite: "strict",
+-                maxAge: expiresAt,
+-            });
+- 
+-            return res.status(200).json({
+-                success: "Sessão atualizada com sucesso!",
+-                accessToken,
+-            });
+-        })
+- 
++      }
++
++      const accessToken = await issueSession(res, user);
++      return res.status(200).json({
++        success: "Login com Google realizado com sucesso",
++        accessToken,
++      });
++    } catch (error) {
++      console.error("Erro no login com Google:", error);
++      return res.status(401).json({ error: "Token do Google inválido" });
+     }
+- 
+-    async logout(req, res) {
+-        const refreshToken = req.cookies?.refreshToken;
+- 
+-        const deleteToken = await tokenModel.deleteToken(refreshToken);
+- 
+-        res.clearCookie("refreshToken"
+-            // , {
+-            // httpOnly: true,
+-            // secure: process.env.COOKIE_ENV === "production",
+-            // sameSite: "strict",}
+-        );
+- 
+-        if (deleteToken.affectedRows > 0) {
+-            return res.status(201).json({ success: "Logout realizado!" })
+-        }
+- 
+-        return res.status(500).json({ error: "Erro ao deletar token" })
++  }
++
++  async refreshToken(req, res) {
++    const refreshToken = req.cookies?.refreshToken;
++
++    if (!refreshToken) {
++      return res.status(401).json({ error: "Token de refresh não encontrado" });
++    }
++
++    try {
++      const [storedToken] = await tokenModel.selectByToken(refreshToken);
++      if (!storedToken) {
++        clearRefreshCookie(res);
++        return res.status(401).json({ error: "Token de refresh inválido" });
++      }
++
++      const decoded = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET);
++      const [user] = await usersModel.selectUserById(storedToken.user_id || decoded.id);
++
++      if (!user || user.user_status === 0) {
++        await tokenModel.deleteToken(refreshToken);
++        clearRefreshCookie(res);
++        return res.status(401).json({ error: "Usuário da sessão não encontrado" });
++      }
++
++      await tokenModel.deleteToken(refreshToken);
++      const accessToken = await issueSession(res, user);
++
++      return res.status(200).json({
++        success: "Sessão atualizada com sucesso",
++        accessToken,
++      });
++    } catch (error) {
++      console.error("Erro ao renovar sessão:", error);
++      clearRefreshCookie(res);
++
++      if (error.name === "TokenExpiredError" || error.name === "JsonWebTokenError") {
++        return res.status(403).json({ error: "Token de refresh inválido ou expirado" });
++      }
++
++      return res.status(500).json({ error: "Erro ao renovar sessão" });
++    }
++  }
++
++  async logout(req, res) {
++    try {
++      const refreshToken = req.cookies?.refreshToken;
++      if (refreshToken) {
++        await tokenModel.deleteToken(refreshToken);
++      }
++
++      clearRefreshCookie(res);
++      return res.status(200).json({ success: "Logout realizado com sucesso" });
++    } catch (error) {
++      console.error("Erro ao realizar logout:", error);
++      clearRefreshCookie(res);
++      return res.status(500).json({ error: "Erro ao realizar logout" });
+     }
+- 
+-    //----------------------------------------------------------------------------------------------------------------------
+-    // async login(req,res){
+-    //     try {
+-    //         const { user_email, user_password } = req.body;
+- 
+-    //         const [user] = await userModel.selectUserByEmail(user_email);
+- 
+-    //         if (!user) {
+-    //             return res.status(404).json({ error: "Usuário não encontrado!" });
+-    //         }
+- 
+-    //         const isPasswordValid = await bcrypt.compare(user_password, user.user_password);
+- 
+-    //         if (!isPasswordValid) {
+-    //             return res.status(401).json({ error: "Senha incorreta!" });
+-    //         }
+- 
+-    //         const token = jwt.sign(
+-    //             { user_id: user.user_id, role_id: user.role_id },
+- 
+-    //             //chave secreta protegida pegando do arquivo .env
+-    //             process.env.JWT_SECRET,
+-    //             { expiresIn: "1d" }
+-    //         );
+- 
+-    //         //retorna o token para o frontend, para que ele possa usar nas próximas requisições
+-    //         return res.status(200).json({ success: "Login bem-sucedido!", token: token });
+-    //     } catch (error) {
+-    //         return res.status(500).json({ error: `Erro ao realizar login! ${error.message}` });
+-    //     }
+-    // }
+- 
+- 
+-    // async changePassword(req,res){
+-    //     try {
+-    //         const { user_id } = req.params;
+-    //         const { new_password } = req.body;
+- 
+-    //         const [user] = await userModel.selectUserById(user_id);
+- 
+-    //         if (!user) {
+-    //             return res.status(404).json({ error: "Usuário não encontrado!" });
+-    //         }
+- 
+-    //         const hashedPassword = await bcrypt.hash(new_password, 10);
+- 
+-    //         const result = await userModel.updateUser(user_id, {
+-    //             ...user,
+-    //             user_password: hashedPassword,
+-    //         });
+- 
+-    //         if (result.affectedRows > 0) {
+-    //             return res.status(200).json({ success: "Senha atualizada com sucesso!" });
+-    //         } else {
+-    //             return res.status(400).json({ error: "Nenhuma alteração foi feita." });
+-    //         }
+-    //     } catch (error) {
+-    //         return res.status(500).json({ error: `Erro ao atualizar senha! ${error.message}` });
+-    //     }
+-    // }
+- 
+- 
++  }
+ }
+- 
++
+ export default new AuthLoginController();
+- 
+- 
+- 
+- 
+\ No newline at end of file
+diff --git a/db/database.js b/db/database.js
+index 9991967..aa3295f 100644
+--- a/db/database.js
++++ b/db/database.js
+@@ -7,14 +7,15 @@ import dotenv from "dotenv";
+ dotenv.config();
+ 
+ const pool = mysql.createPool({
+-    host: process.env.DB_HOST,
+-    port: process.env.DB_PORT,
+-    user: process.env.DB_USER,
+-    password: process.env.DB_PASSWORD,
+-    database: process.env.DB_NAME,
++    host: process.env.DB_HOST || "localhost",
++    port: Number(process.env.DB_PORT || 3306),
++    user: process.env.DB_USER || "root",
++    password: process.env.DB_PASSWORD || "",
++    database: process.env.DB_NAME || "mercado_scraper",
+     waitForConnections: true,
+     connectionLimit: 10,
+-    queueLimit: 0
++    queueLimit: 0,
++    charset: "utf8mb4",
+ });
+ 
+ export default pool;
+\ No newline at end of file
+diff --git a/middlewares/LoginMiddleware.js b/middlewares/LoginMiddleware.js
+new file mode 100644
+index 0000000..9576743
+--- /dev/null
++++ b/middlewares/LoginMiddleware.js
+@@ -0,0 +1,13 @@
++export default function validateLogin(req, res, next) {
++  const { user_email, user_password } = req.body && typeof req.body === "object" ? req.body : {};
++
++  if (typeof user_email !== "string" || !user_email.trim()) {
++    return res.status(400).json({ error: "O e-mail é obrigatório" });
++  }
++
++  if (typeof user_password !== "string" || !user_password) {
++    return res.status(400).json({ error: "A senha é obrigatória" });
++  }
++
++  return next();
++}
+diff --git a/middlewares/RegisterMiddleware.js b/middlewares/RegisterMiddleware.js
+index ded19e3..86a94da 100644
+--- a/middlewares/RegisterMiddleware.js
++++ b/middlewares/RegisterMiddleware.js
+@@ -1,52 +1,53 @@
+-const validateUser = (req, res, next) => {
+-  const {
+-    user_name,
+-    user_email,
+-    user_password
+-  } = req.body;
++const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
++const passwordPattern = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&]).{8,}$/;
+ 
+-  const errors = [];
+-
+-  const newName = user_name?.trim();
+-  const newEmail = user_email?.trim();
+-  const newPassword = user_password?.trim();
+-
+-  const regexEmail =
+-    /^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
++function validateNameAndEmail(body, errors) {
++  if (typeof body.user_name !== "string" || body.user_name.trim().length < 3 || body.user_name.trim().length > 150) {
++    errors.push("O nome deve ter entre 3 e 150 caracteres");
++  }
+ 
+-  const regexPassword =
+-    /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&]).{8,}$/;
++  if (typeof body.user_email !== "string" || !emailPattern.test(body.user_email.trim())) {
++    errors.push("E-mail inválido");
++  }
++}
+ 
+-  // Nome
+-  if (!newName) {
+-    errors.push("O nome é obrigatório!");
+-  } else if (newName.length < 3 || newName.length > 150) {
+-    errors.push("O nome deve ter entre 3 e 150 caracteres!");
++function validatePassword(password, errors, required = true) {
++  if (password === undefined || password === null || password === "") {
++    if (required) errors.push("A senha é obrigatória");
++    return;
+   }
+ 
+-  // Email
+-  if (!newEmail) {
+-    errors.push("O e-mail é obrigatório!");
+-  } else if (!regexEmail.test(newEmail)) {
+-    errors.push("E-mail inválido!");
++  if (typeof password !== "string" || !passwordPattern.test(password)) {
++    errors.push("A senha deve ter no mínimo 8 caracteres, contendo letra maiúscula, minúscula, número e caractere especial");
+   }
++}
++
++function validateUser(req, res, next) {
++  const errors = [];
++  const body = req.body && typeof req.body === "object" ? req.body : {};
+ 
+-  // Senha
+-  if (!newPassword) {
+-    errors.push("A senha é obrigatória!");
+-  } else if (!regexPassword.test(newPassword)) {
+-    errors.push(
+-      "A senha deve ter no mínimo 8 caracteres, contendo letra maiúscula, minúscula, número e caractere especial!"
+-    );
++  validateNameAndEmail(body, errors);
++  validatePassword(body.user_password, errors, true);
++
++  if (errors.length > 0) {
++    return res.status(400).json({ error: errors[0] });
+   }
+ 
++  return next();
++}
++
++export function validateUserUpdate(req, res, next) {
++  const errors = [];
++  const body = req.body && typeof req.body === "object" ? req.body : {};
++
++  validateNameAndEmail(body, errors);
++  validatePassword(body.user_password, errors, false);
++
+   if (errors.length > 0) {
+-    return res.status(400).json({
+-      error: errors[0]
+-    });
++    return res.status(400).json({ error: errors[0] });
+   }
+ 
+-  next();
+-};
++  return next();
++}
+ 
+-export default validateUser;
+\ No newline at end of file
++export default validateUser;
+diff --git a/middlewares/authLoginMiddleware.js b/middlewares/authLoginMiddleware.js
+index 74aa685..8c35776 100644
+--- a/middlewares/authLoginMiddleware.js
++++ b/middlewares/authLoginMiddleware.js
+@@ -1,53 +1,40 @@
+ import dotenv from "dotenv";
+ import jwt from "jsonwebtoken";
+ 
+-dotenv.config()
+-
+-
+-// posso exportar como default colocando o export ao criar a constant ou classe
+-export const authenticationToken = (req, res, next) => {
+-
+-    const getToken = req.headers.authorization;
+-    
+-    if(!getToken){
+-
+-        return res.status(401).json({
+-            error:" token nao fornecido!"
+-        });
++dotenv.config();
++
++export function authenticationToken(req, res, next) {
++  const authorization = req.headers.authorization;
++  const [scheme, token] = authorization?.split(" ") || [];
++
++  if (scheme?.toLowerCase() !== "bearer" || !token) {
++    return res.status(401).json({ error: "Token Bearer não fornecido" });
++  }
++
++  try {
++    req.user = jwt.verify(token, process.env.ACCESS_TOKEN_SECRET);
++    return next();
++  } catch (error) {
++    if (error.name === "TokenExpiredError") {
++      return res.status(401).json({ error: "Token expirado" });
+     }
+ 
++    return res.status(403).json({ error: "Token inválido" });
++  }
++}
+ 
+-    const bearerTokken = getToken.split(" ")[1];
+-    if (!bearerTokken) {
+-        return res.status(401).json({ error: "Token não fornecido" })
++export function adminRole(...allowedRoles) {
++  return (req, res, next) => {
++    if (!req.user) {
++      return res.status(401).json({ error: "Usuário não autenticado" });
+     }
+ 
+-
+-    //
+-    jwt.verify(bearerTokken, process.env.ACCESS_TOKEN_SECRET, (error, user) => {
+-        if (error) {
+-            return res.status(403).json({ error: "Token inválido!" })
+-        }
+-
+-        req.user = user
+-
+-        next()
+-    });
+-};
+-
+-export const adminRole = (...allowedRoles) => {
+-
+-    return (req, res, next) => {
+-        if (!req.user) {
+-            return res.status(401).json({ error: "Usuário não autenticado" });
+-        }
+-
+-        if (!allowedRoles.includes(req.user.role)) {
+-            return res.status(403).json({ error: "Acesso negado. Função não autorizada." });
+-        }
+-        next();
+-
++    if (!allowedRoles.map(String).includes(String(req.user.role))) {
++      return res.status(403).json({ error: "Acesso negado. Função não autorizada" });
+     }
++
++    return next();
++  };
+ }
+ 
+-export default { authenticationToken, adminRole }
+\ No newline at end of file
++export default { authenticationToken, adminRole };
+diff --git a/models/RegisterModel.js b/models/RegisterModel.js
+index 42d8597..dc33a09 100644
+--- a/models/RegisterModel.js
++++ b/models/RegisterModel.js
+@@ -1,7 +1,125 @@
+-const userModel = {
+-  async insertUser() {
+-    return { affectedRows: 1 };
++import pool from "../db/database.js";
++
++const USER_FIELDS = `
++  u.user_id,
++  u.user_name,
++  u.user_email,
++  u.user_password,
++  u.role_id,
++  u.user_status,
++  u.user_google_id,
++  COALESCE(r.role_name, CAST(u.role_id AS CHAR)) AS role_name
++`;
++
++const FALLBACK_USER_FIELDS = `
++  user_id,
++  user_name,
++  user_email,
++  user_password,
++  role_id,
++  user_status,
++  user_google_id,
++  CAST(role_id AS CHAR) AS role_name
++`;
++
++async function executeUserQuery(where = "", params = [], options = {}) {
++  const query = `
++    SELECT ${options.fallback ? FALLBACK_USER_FIELDS : USER_FIELDS}
++    FROM ${options.fallback ? "users" : "users u LEFT JOIN roles r ON r.role_id = u.role_id"}
++    ${where}
++  `;
++
++  return pool.execute(query, params);
++}
++
++async function selectUsers(where = "", params = []) {
++  try {
++    return await executeUserQuery(where, params);
++  } catch (error) {
++    // Permite o funcionamento em bancos que ainda não possuem a tabela roles.
++    if (["ER_NO_SUCH_TABLE", "ER_BAD_FIELD_ERROR"].includes(error.code)) {
++      return executeUserQuery(where.replaceAll("u.", ""), params, { fallback: true });
++    }
++    throw error;
+   }
++}
++
++const userModel = {
++  async selectAllUsers() {
++    const [rows] = await selectUsers("ORDER BY u.user_id DESC");
++    return rows;
++  },
++
++  async selectUserById(userId) {
++    const [rows] = await selectUsers("WHERE u.user_id = ? LIMIT 1", [userId]);
++    return rows;
++  },
++
++  async selectUserByEmail(email, excludedUserId = null) {
++    const where = ["WHERE LOWER(u.user_email) = LOWER(?)"];
++    const params = [email];
++
++    if (excludedUserId !== null && excludedUserId !== undefined) {
++      where.push("AND u.user_id <> ?");
++      params.push(excludedUserId);
++    }
++
++    where.push("LIMIT 1");
++    return selectUsers(where.join(" "), params).then(([rows]) => rows);
++  },
++
++  async selectUserByGoogleId(googleId) {
++    return selectUsers("WHERE u.user_google_id = ? LIMIT 1", [googleId]).then(([rows]) => rows);
++  },
++
++  async insertUser({ user_name, user_email, user_password, role_id = 1, user_status = 1 }) {
++    const [result] = await pool.execute(
++      `INSERT INTO users
++        (user_name, user_email, user_password, role_id, user_status)
++       VALUES (?, ?, ?, ?, ?)`,
++      [user_name, user_email, user_password, role_id, user_status],
++    );
++    return result;
++  },
++
++  async insertGoogleUser({
++    user_name,
++    user_email,
++    user_google_id,
++    role_id = 1,
++    user_status = 1,
++  }) {
++    const [result] = await pool.execute(
++      `INSERT INTO users
++        (user_name, user_email, user_google_id, role_id, user_status)
++       VALUES (?, ?, ?, ?, ?)`,
++      [user_name, user_email, user_google_id, role_id, user_status],
++    );
++    return result;
++  },
++
++  async linkGoogleAccount(userId, googleId) {
++    const [result] = await pool.execute(
++      "UPDATE users SET user_google_id = ? WHERE user_id = ?",
++      [googleId, userId],
++    );
++    return result;
++  },
++
++  async updateUser(userId, { user_name, user_email, user_password }) {
++    const [result] = await pool.execute(
++      `UPDATE users
++       SET user_name = ?, user_email = ?, user_password = ?
++       WHERE user_id = ?`,
++      [user_name, user_email, user_password, userId],
++    );
++    return result;
++  },
++
++  async deleteUser(userId) {
++    const [result] = await pool.execute("DELETE FROM users WHERE user_id = ?", [userId]);
++    return result;
++  },
+ };
+ 
+-export default userModel;
+\ No newline at end of file
++export default userModel;
+diff --git a/models/ShoppingListModel.js b/models/ShoppingListModel.js
+new file mode 100644
+index 0000000..327e032
+--- /dev/null
++++ b/models/ShoppingListModel.js
+@@ -0,0 +1,177 @@
++import pool from "../db/database.js";
++
++function normalizeListName(listName) {
++  const value = typeof listName === "string" ? listName.trim() : "";
++  return value || "Minha lista";
++}
++
++const shoppingListModel = {
++  async createList(userId, listName) {
++    const [result] = await pool.execute(
++      "INSERT INTO shopping_lists (user_id, list_name) VALUES (?, ?)",
++      [userId, normalizeListName(listName)],
++    );
++    return result;
++  },
++
++  async selectListsByUser(userId) {
++    const [rows] = await pool.execute(
++      `SELECT
++         sl.list_id,
++         sl.list_name,
++         sl.is_archived,
++         sl.created_at,
++         sl.updated_at,
++         COUNT(sli.item_id) AS item_count,
++         SUM(CASE WHEN sli.is_checked = 0 THEN 1 ELSE 0 END) AS pending_item_count
++       FROM shopping_lists sl
++       LEFT JOIN shopping_list_items sli ON sli.list_id = sl.list_id
++       WHERE sl.user_id = ?
++       GROUP BY sl.list_id, sl.list_name, sl.is_archived, sl.created_at, sl.updated_at
++       ORDER BY sl.is_archived ASC, sl.updated_at DESC`,
++      [userId],
++    );
++    return rows;
++  },
++
++  async selectListById(userId, listId) {
++    const [rows] = await pool.execute(
++      `SELECT list_id, user_id, list_name, is_archived, created_at, updated_at
++       FROM shopping_lists
++       WHERE list_id = ? AND user_id = ?
++       LIMIT 1`,
++      [listId, userId],
++    );
++    return rows[0] || null;
++  },
++
++  async selectItems(userId, listId) {
++    const [rows] = await pool.execute(
++      `SELECT
++         sli.item_id,
++         sli.list_id,
++         sli.product_id,
++         sli.comparison_key,
++         sli.product_name,
++         sli.source,
++         sli.external_id,
++         sli.quantity,
++         sli.unit,
++         sli.price_at_added,
++         sli.notes,
++         sli.is_checked,
++         sli.created_at,
++         sli.updated_at,
++         p.price,
++         p.promotional_price,
++         p.available,
++         p.image_url,
++         p.product_url
++       FROM shopping_list_items sli
++       INNER JOIN shopping_lists sl ON sl.list_id = sli.list_id
++       LEFT JOIN products p ON p.id = sli.product_id
++       WHERE sli.list_id = ? AND sl.user_id = ?
++       ORDER BY sli.is_checked ASC, sli.created_at DESC`,
++      [listId, userId],
++    );
++    return rows;
++  },
++
++  async selectProduct(productId) {
++    const [rows] = await pool.execute(
++      `SELECT id, source, external_id, name, price, promotional_price, unit, product_url
++       FROM products
++       WHERE id = ?
++       LIMIT 1`,
++      [productId],
++    );
++    return rows[0] || null;
++  },
++
++  async addItem(userId, listId, item) {
++    const list = await this.selectListById(userId, listId);
++    if (!list) return { error: "LIST_NOT_FOUND" };
++
++    let product = null;
++    if (item.product_id !== undefined && item.product_id !== null) {
++      product = await this.selectProduct(item.product_id);
++      if (!product) return { error: "PRODUCT_NOT_FOUND" };
++    }
++
++    const productName = item.product_name?.trim() || product?.name;
++    if (!productName) return { error: "PRODUCT_NAME_REQUIRED" };
++
++    const [result] = await pool.execute(
++      `INSERT INTO shopping_list_items
++        (list_id, product_id, comparison_key, product_name, source, external_id,
++         quantity, unit, price_at_added, notes)
++       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
++      [
++        listId,
++        product?.id ?? item.product_id ?? null,
++        item.comparison_key?.trim() || null,
++        productName,
++        item.source?.trim() || product?.source || null,
++        item.external_id?.trim() || product?.external_id || null,
++        item.quantity ?? 1,
++        item.unit?.trim() || product?.unit || null,
++        item.price_at_added ?? product?.promotional_price ?? product?.price ?? null,
++        item.notes?.trim() || null,
++      ],
++    );
++
++    return { result, list };
++  },
++
++  async updateItem(userId, listId, itemId, changes) {
++    const fields = [];
++    const values = [];
++
++    if (changes.quantity !== undefined) {
++      fields.push("quantity = ?");
++      values.push(changes.quantity);
++    }
++    if (changes.notes !== undefined) {
++      fields.push("notes = ?");
++      values.push(changes.notes?.trim() || null);
++    }
++    if (changes.is_checked !== undefined) {
++      fields.push("is_checked = ?");
++      values.push(changes.is_checked ? 1 : 0);
++    }
++
++    if (fields.length === 0) return { affectedRows: 0 };
++
++    values.push(itemId, listId, userId);
++    const [result] = await pool.execute(
++      `UPDATE shopping_list_items sli
++       INNER JOIN shopping_lists sl ON sl.list_id = sli.list_id
++       SET ${fields.join(", ")}
++       WHERE sli.item_id = ? AND sli.list_id = ? AND sl.user_id = ?`,
++      values,
++    );
++    return result;
++  },
++
++  async deleteItem(userId, listId, itemId) {
++    const [result] = await pool.execute(
++      `DELETE sli FROM shopping_list_items sli
++       INNER JOIN shopping_lists sl ON sl.list_id = sli.list_id
++       WHERE sli.item_id = ? AND sli.list_id = ? AND sl.user_id = ?`,
++      [itemId, listId, userId],
++    );
++    return result;
++  },
++
++  async archiveList(userId, listId, isArchived = true) {
++    const [result] = await pool.execute(
++      `UPDATE shopping_lists
++       SET is_archived = ?
++       WHERE list_id = ? AND user_id = ?`,
++      [isArchived ? 1 : 0, listId, userId],
++    );
++    return result;
++  },
++};
++
++export default shoppingListModel;
+diff --git a/models/tokenModel.js b/models/tokenModel.js
+index 51b2802..57ec7fa 100644
+--- a/models/tokenModel.js
++++ b/models/tokenModel.js
+@@ -1,23 +1,34 @@
+ import pool from "../db/database.js";
+ 
+-
+-class TokkenModel{
+-    async createToken(tokenData){
+-        const {token, user_id, expires_at} = tokenData;
+-        const [result] = await pool.execute("INSERT INTO tokens ( token, expires_at, user_id) VALUES (?,?,?);",[token, expires_at, user_id]);
+-        return result;
++class TokenModel {
++  async createToken({ token, user_id, expires_at }) {
++    if (!token || !user_id || !expires_at) {
++      throw new Error("Dados incompletos para criar token");
+     }
+ 
+-    async selectByToken(token){
+-        const [result] = await pool.execute("select * from tokens where token =?;",[token]);
+-        return result;
+-    }
++    const [result] = await pool.execute(
++      "INSERT INTO tokens (token, expires_at, user_id) VALUES (?, ?, ?)",
++      [token, expires_at, user_id],
++    );
++    return result;
++  }
+ 
+-    async deleteToken(token){
+-        const [result] = await pool.execute("delete from tokens where token=?;",[token]);
+-        return result;
+-    }
++  async selectByToken(token) {
++    if (!token) return [];
++
++    const [rows] = await pool.execute(
++      "SELECT token, user_id, expires_at FROM tokens WHERE token = ? LIMIT 1",
++      [token],
++    );
++    return rows;
++  }
++
++  async deleteToken(token) {
++    if (!token) return { affectedRows: 0 };
+ 
++    const [result] = await pool.execute("DELETE FROM tokens WHERE token = ?", [token]);
++    return result;
++  }
+ }
+ 
+-export default new TokkenModel()
+\ No newline at end of file
++export default new TokenModel();
+diff --git a/package.json b/package.json
+index cab56a0..0d065c3 100644
+--- a/package.json
++++ b/package.json
+@@ -5,7 +5,8 @@
+   "main": "server.js",
+   "scripts": {
+     "dev": "nodemon server.js",
+-    "start": "node server.js"
++    "start": "node server.js",
++    "check": "node --test"
+   },
+   "keywords": [],
+   "author": "",
+diff --git a/routes/LoginRoutes.js b/routes/LoginRoutes.js
+index 1ccaeb5..b1ad9f4 100644
+--- a/routes/LoginRoutes.js
++++ b/routes/LoginRoutes.js
+@@ -1,12 +1,13 @@
+ import express from "express";
++
+ import authLoginController from "../controllers/authLoginController.js";
+-import {authenticationToken}  from "../middlewares/authLoginMiddleware.js";
++import validateLogin from "../middlewares/LoginMiddleware.js";
+ 
+ const loginRoute = express.Router();
+ 
+-loginRoute.post("/login", authLoginController.login);
++loginRoute.post("/login", validateLogin, authLoginController.login);
++loginRoute.post("/login/google", authLoginController.googleLogin);
+ loginRoute.post("/logout", authLoginController.logout);
+ loginRoute.post("/refresh", authLoginController.refreshToken);
+ 
+-
+-export default loginRoute;
+\ No newline at end of file
++export default loginRoute;
+diff --git a/routes/RegisterRouter.js b/routes/RegisterRouter.js
+index ba9bd63..d9f036e 100644
+--- a/routes/RegisterRouter.js
++++ b/routes/RegisterRouter.js
+@@ -1,18 +1,16 @@
+ import express from "express";
++
+ import usersController from "../controllers/RegisterController.js";
+-import validateUser from "../middlewares/RegisterMiddleware.js";
+-import {authenticationToken} from "../middlewares/authLoginMiddleware.js"
++import validateUser, { validateUserUpdate } from "../middlewares/RegisterMiddleware.js";
++import { authenticationToken } from "../middlewares/authLoginMiddleware.js";
+ 
+ const userRouter = express.Router();
+ 
+-userRouter.get("/",authenticationToken, usersController.getAllUsers);
+-userRouter.get("/user_id/:user_id",authenticationToken, usersController.getUserById);
+-userRouter.get("/user_email/:user_email",authenticationToken, usersController.getUserByEmail);
++userRouter.get("/", authenticationToken, usersController.getAllUsers);
++userRouter.get("/user_id/:user_id", authenticationToken, usersController.getUserById);
++userRouter.get("/user_email/:user_email", authenticationToken, usersController.getUserByEmail);
+ userRouter.post("/", validateUser, usersController.createUser);
+-userRouter.put("/:user_id",authenticationToken, validateUser, usersController.updateUser);
+-userRouter.delete("/:user_id",authenticationToken, usersController.deleteUser);
+-
+-
+-
++userRouter.put("/:user_id", authenticationToken, validateUserUpdate, usersController.updateUser);
++userRouter.delete("/:user_id", authenticationToken, usersController.deleteUser);
+ 
+-export default userRouter;
+\ No newline at end of file
++export default userRouter;
+diff --git a/routes/ShoppingListRoutes.js b/routes/ShoppingListRoutes.js
+new file mode 100644
+index 0000000..d4ec488
+--- /dev/null
++++ b/routes/ShoppingListRoutes.js
+@@ -0,0 +1,17 @@
++import express from "express";
++
++import shoppingListController from "../controllers/ShoppingListController.js";
++import { authenticationToken } from "../middlewares/authLoginMiddleware.js";
++
++const shoppingListRouter = express.Router();
++
++shoppingListRouter.use(authenticationToken);
++shoppingListRouter.post("/", shoppingListController.createList);
++shoppingListRouter.get("/", shoppingListController.getLists);
++shoppingListRouter.patch("/:listId", shoppingListController.archiveList);
++shoppingListRouter.get("/:listId/items", shoppingListController.getItems);
++shoppingListRouter.post("/:listId/items", shoppingListController.addItem);
++shoppingListRouter.patch("/:listId/items/:itemId", shoppingListController.updateItem);
++shoppingListRouter.delete("/:listId/items/:itemId", shoppingListController.deleteItem);
++
++export default shoppingListRouter;
+diff --git a/server.js b/server.js
+index 40b9137..bffce1b 100644
+--- a/server.js
++++ b/server.js
+@@ -1,32 +1,10 @@
+-import express from "express";
+-import cors from "cors";
+ import dotenv from "dotenv";
+-import cookieParser from "cookie-parser";
+-
+-import userRoute from "./routes/RegisterRouter.js";
+-import loginRoute from "./routes/LoginRoutes.js";
++import app from "./app.js";
+ 
+ dotenv.config();
+ 
+-const app = express();
+-
+-app.use(express.json());
+-
+-app.use(
+-  cors({
+-    origin: "*",
+-    credentials: false,
+-  })
+-);
+-
+-app.use(cookieParser());
+-
+-// Rotas
+-app.use("/user",userRoute);
+-app.use(loginRoute);
+-
+-const PORT = process.env.PORT_SERVER || 3000;
++const PORT = Number(process.env.PORT_SERVER || process.env.PORT || 3000);
+ 
+ app.listen(PORT, () => {
+   console.log(`Servidor rodando em http://localhost:${PORT}`);
+-});
+\ No newline at end of file
++});
+diff --git a/sql/mercado_scraper.sql b/sql/mercado_scraper.sql
+new file mode 100644
+index 0000000..1754326
+--- /dev/null
++++ b/sql/mercado_scraper.sql
+@@ -0,0 +1,133 @@
++-- Schema do CompraSmart / Mercado Scraper
++-- Execute este arquivo com um usuário MySQL que tenha permissão para criar banco e tabelas.
++
++CREATE DATABASE IF NOT EXISTS mercado_scraper
++  CHARACTER SET utf8mb4
++  COLLATE utf8mb4_unicode_ci;
++
++USE mercado_scraper;
++
++SET NAMES utf8mb4;
++SET FOREIGN_KEY_CHECKS = 0;
++
++CREATE TABLE IF NOT EXISTS roles (
++  role_id INT UNSIGNED NOT NULL AUTO_INCREMENT,
++  role_name VARCHAR(50) NOT NULL,
++  PRIMARY KEY (role_id),
++  UNIQUE KEY uq_roles_name (role_name)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
++
++INSERT IGNORE INTO roles (role_id, role_name)
++VALUES (1, 'user'), (2, 'admin');
++
++CREATE TABLE IF NOT EXISTS users (
++  user_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
++  user_name VARCHAR(150) NOT NULL,
++  user_email VARCHAR(255) NOT NULL,
++  user_password VARCHAR(255) NULL,
++  user_google_id VARCHAR(255) NULL,
++  role_id INT UNSIGNED NOT NULL DEFAULT 1,
++  user_status TINYINT(1) NOT NULL DEFAULT 1,
++  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
++  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
++  PRIMARY KEY (user_id),
++  UNIQUE KEY uq_users_email (user_email),
++  UNIQUE KEY uq_users_google_id (user_google_id),
++  KEY idx_users_role (role_id),
++  KEY idx_users_status (user_status),
++  CONSTRAINT fk_users_role
++    FOREIGN KEY (role_id) REFERENCES roles (role_id)
++    ON UPDATE CASCADE
++    ON DELETE RESTRICT
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
++
++CREATE TABLE IF NOT EXISTS tokens (
++  token_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
++  token VARCHAR(512) NOT NULL,
++  user_id BIGINT UNSIGNED NOT NULL,
++  expires_at DATETIME NOT NULL,
++  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
++  PRIMARY KEY (token_id),
++  UNIQUE KEY uq_tokens_token (token),
++  KEY idx_tokens_user (user_id),
++  KEY idx_tokens_expires (expires_at),
++  CONSTRAINT fk_tokens_user
++    FOREIGN KEY (user_id) REFERENCES users (user_id)
++    ON UPDATE CASCADE
++    ON DELETE CASCADE
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
++
++CREATE TABLE IF NOT EXISTS products (
++  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
++  source VARCHAR(30) NOT NULL,
++  external_id VARCHAR(255) NULL,
++  name VARCHAR(500) NOT NULL,
++  brand VARCHAR(255) NULL,
++  category VARCHAR(255) NULL,
++  sku VARCHAR(255) NULL,
++  price DECIMAL(12,2) NULL,
++  promotional_price DECIMAL(12,2) NULL,
++  unit VARCHAR(100) NULL,
++  available TINYINT(1) NOT NULL DEFAULT 1,
++  image_url TEXT NULL,
++  product_url TEXT NOT NULL,
++  raw_data JSON NULL,
++  collected_at DATETIME NOT NULL,
++  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
++  PRIMARY KEY (id),
++  UNIQUE KEY uq_source_product_url (source, product_url(255)),
++  KEY idx_source_category (source, category),
++  KEY idx_collected_at (collected_at),
++  KEY idx_external_id (source, external_id),
++  KEY idx_product_name (name(191))
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
++
++CREATE TABLE IF NOT EXISTS shopping_lists (
++  list_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
++  user_id BIGINT UNSIGNED NOT NULL,
++  list_name VARCHAR(150) NOT NULL DEFAULT 'Minha lista',
++  is_archived TINYINT(1) NOT NULL DEFAULT 0,
++  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
++  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
++  PRIMARY KEY (list_id),
++  UNIQUE KEY uq_user_list_name (user_id, list_name),
++  KEY idx_lists_user_archived (user_id, is_archived),
++  CONSTRAINT fk_lists_user
++    FOREIGN KEY (user_id) REFERENCES users (user_id)
++    ON UPDATE CASCADE
++    ON DELETE CASCADE
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
++
++CREATE TABLE IF NOT EXISTS shopping_list_items (
++  item_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
++  list_id BIGINT UNSIGNED NOT NULL,
++  product_id BIGINT UNSIGNED NULL,
++  comparison_key VARCHAR(255) NULL,
++  product_name VARCHAR(500) NOT NULL,
++  source VARCHAR(30) NULL,
++  external_id VARCHAR(255) NULL,
++  quantity DECIMAL(10,3) NOT NULL DEFAULT 1.000,
++  unit VARCHAR(100) NULL,
++  price_at_added DECIMAL(12,2) NULL,
++  notes VARCHAR(500) NULL,
++  is_checked TINYINT(1) NOT NULL DEFAULT 0,
++  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
++  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
++  PRIMARY KEY (item_id),
++  KEY idx_items_list_checked (list_id, is_checked),
++  KEY idx_items_comparison (list_id, comparison_key),
++  KEY idx_items_product (product_id),
++  CONSTRAINT fk_items_list
++    FOREIGN KEY (list_id) REFERENCES shopping_lists (list_id)
++    ON UPDATE CASCADE
++    ON DELETE CASCADE,
++  CONSTRAINT fk_items_product
++    FOREIGN KEY (product_id) REFERENCES products (id)
++    ON UPDATE CASCADE
++    ON DELETE SET NULL
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
++
++SET FOREIGN_KEY_CHECKS = 1;
++
++-- Produtos expirados podem ser removidos sem apagar o item salvo na lista:
++-- o item mantém product_name, source, external_id e price_at_added como snapshot.
+diff --git a/test/auth.test.js b/test/auth.test.js
+new file mode 100644
+index 0000000..45da0cb
+--- /dev/null
++++ b/test/auth.test.js
+@@ -0,0 +1,220 @@
++import assert from "node:assert/strict";
++import { createServer } from "node:http";
++import test, { after, before } from "node:test";
++
++process.env.ACCESS_TOKEN_SECRET = "test-access-secret";
++process.env.REFRESH_TOKEN_SECRET = "test-refresh-secret";
++process.env.CORS_ORIGINS = "http://localhost:5173";
++
++const { default: app } = await import("../app.js");
++const { default: validateLogin } = await import("../middlewares/LoginMiddleware.js");
++const { default: generateTokens } = await import("../utils/generateTokken.js");
++const { authenticationToken } = await import("../middlewares/authLoginMiddleware.js");
++
++let server;
++let baseUrl;
++
++before(async () => {
++  server = createServer(app);
++  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
++  server.unref();
++  const { port } = server.address();
++  baseUrl = `http://127.0.0.1:${port}`;
++});
++
++after(async () => {
++  server.closeAllConnections?.();
++  await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
++});
++
++test("health check responde 200", async () => {
++  const response = await fetch(`${baseUrl}/health`);
++  assert.equal(response.status, 200);
++  assert.deepEqual(await response.json(), { status: "ok" });
++});
++
++test("preflight permitido retorna CORS com credenciais", async () => {
++  const response = await fetch(`${baseUrl}/login`, {
++    method: "OPTIONS",
++    headers: {
++      Origin: "http://localhost:5173",
++      "Access-Control-Request-Method": "POST",
++      "Access-Control-Request-Headers": "Content-Type",
++    },
++  });
++
++  assert.equal(response.status, 204);
++  assert.equal(response.headers.get("access-control-allow-origin"), "http://localhost:5173");
++  assert.equal(response.headers.get("access-control-allow-credentials"), "true");
++});
++
++test("validação de login rejeita campos ausentes", () => {
++  let statusCode;
++  let payload;
++  let nextCalled = false;
++  const response = {
++    status(code) {
++      statusCode = code;
++      return this;
++    },
++    json(body) {
++      payload = body;
++      return this;
++    },
++  };
++
++  validateLogin({ body: {} }, response, () => {
++    nextCalled = true;
++  });
++
++  assert.equal(statusCode, 400);
++  assert.deepEqual(payload, { error: "O e-mail é obrigatório" });
++  assert.equal(nextCalled, false);
++});
++
++test("tokens de acesso carregam identidade e podem ser validados", () => {
++  const user = { user_id: 7, user_email: "user@example.com", role_id: 1 };
++  const token = generateTokens.generateAccessToken(user);
++  let authenticatedUser;
++  let statusCode;
++
++  authenticationToken(
++    { headers: { authorization: `Bearer ${token}` } },
++    {
++      status(code) {
++        statusCode = code;
++        return this;
++      },
++      json() {
++        return this;
++      },
++    },
++    () => {},
++  );
++
++  assert.equal(statusCode, undefined);
++  assert.ok(token);
++
++  authenticationToken(
++    { headers: { authorization: `Bearer ${token}` } },
++    {},
++    function next() {
++      authenticatedUser = true;
++    },
++  );
++
++  assert.equal(authenticatedUser, true);
++});
++
++
++test("cadastro e login percorrem o fluxo HTTP esperado", { concurrency: false }, async () => {
++  const { default: bcrypt } = await import("bcrypt");
++  const { default: usersModel } = await import("../models/RegisterModel.js");
++  const { default: tokenModel } = await import("../models/tokenModel.js");
++  const passwordHash = await bcrypt.hash("Senha@123", 4);
++  const user = {
++    user_id: 7,
++    user_name: "Usuário Teste",
++    user_email: "user@example.com",
++    user_password: passwordHash,
++    role_id: 1,
++    role_name: "user",
++    user_status: 1,
++  };
++  const originalSelectByEmail = usersModel.selectUserByEmail;
++  const originalInsertUser = usersModel.insertUser;
++  const originalCreateToken = tokenModel.createToken;
++
++  usersModel.selectUserByEmail = async () => [];
++  usersModel.insertUser = async () => ({ affectedRows: 1, insertId: 7 });
++  tokenModel.createToken = async () => ({ affectedRows: 1 });
++
++  try {
++    const registerResponse = await fetch(`${baseUrl}/user`, {
++      method: "POST",
++      headers: { "Content-Type": "application/json" },
++      body: JSON.stringify({
++        user_name: "Usuário Teste",
++        user_email: "user@example.com",
++        user_password: "Senha@123",
++      }),
++    });
++
++    assert.equal(registerResponse.status, 201);
++    assert.equal((await registerResponse.json()).user_id, 7);
++
++    usersModel.selectUserByEmail = async () => [user];
++    const loginResponse = await fetch(`${baseUrl}/login`, {
++      method: "POST",
++      headers: { "Content-Type": "application/json" },
++      body: JSON.stringify({
++        user_email: "user@example.com",
++        user_password: "Senha@123",
++      }),
++    });
++
++    assert.equal(loginResponse.status, 200);
++    assert.ok((await loginResponse.json()).accessToken);
++    assert.match(loginResponse.headers.get("set-cookie") || "", /refreshToken=/);
++  } finally {
++    usersModel.selectUserByEmail = originalSelectByEmail;
++    usersModel.insertUser = originalInsertUser;
++    tokenModel.createToken = originalCreateToken;
++  }
++});
++
++
++test("lista de compras exige autenticação e aceita itens", { concurrency: false }, async () => {
++  const { default: shoppingListModel } = await import("../models/ShoppingListModel.js");
++  const token = generateTokens.generateAccessToken({
++    user_id: 7,
++    user_email: "user@example.com",
++    role_id: 1,
++  });
++  const originalCreateList = shoppingListModel.createList;
++  const originalAddItem = shoppingListModel.addItem;
++
++  shoppingListModel.createList = async () => ({ insertId: 10 });
++  shoppingListModel.addItem = async () => ({
++    result: { insertId: 25 },
++    list: { list_id: 10 },
++  });
++
++  try {
++    const unauthorizedResponse = await fetch(`${baseUrl}/shopping-lists`, {
++      method: "POST",
++      headers: { "Content-Type": "application/json" },
++      body: JSON.stringify({ list_name: "Compras da semana" }),
++    });
++    assert.equal(unauthorizedResponse.status, 401);
++
++    const createResponse = await fetch(`${baseUrl}/shopping-lists`, {
++      method: "POST",
++      headers: {
++        Authorization: `Bearer ${token}`,
++        "Content-Type": "application/json",
++      },
++      body: JSON.stringify({ list_name: "Compras da semana" }),
++    });
++    assert.equal(createResponse.status, 201);
++    assert.equal((await createResponse.json()).list_id, 10);
++
++    const addResponse = await fetch(`${baseUrl}/shopping-lists/10/items`, {
++      method: "POST",
++      headers: {
++        Authorization: `Bearer ${token}`,
++        "Content-Type": "application/json",
++      },
++      body: JSON.stringify({
++        product_id: 123,
++        comparison_key: "arroz-tipo-1-5kg",
++        quantity: 2,
++      }),
++    });
++    assert.equal(addResponse.status, 201);
++    assert.equal((await addResponse.json()).item_id, 25);
++  } finally {
++    shoppingListModel.createList = originalCreateList;
++    shoppingListModel.addItem = originalAddItem;
++  }
++});
+diff --git a/test/schema.test.js b/test/schema.test.js
+new file mode 100644
+index 0000000..f773c96
+--- /dev/null
++++ b/test/schema.test.js
+@@ -0,0 +1,26 @@
++import assert from "node:assert/strict";
++import { readFile } from "node:fs/promises";
++import test from "node:test";
++
++const schema = await readFile(new URL("../sql/mercado_scraper.sql", import.meta.url), "utf8");
++
++test("schema cria banco e entidades essenciais", () => {
++  for (const table of [
++    "roles",
++    "users",
++    "tokens",
++    "products",
++    "shopping_lists",
++    "shopping_list_items",
++  ]) {
++    assert.match(schema, new RegExp(`CREATE TABLE IF NOT EXISTS ${table}\\b`));
++  }
++
++  assert.match(schema, /CREATE DATABASE IF NOT EXISTS mercado_scraper/);
++  assert.match(schema, /FOREIGN KEY \(role_id\) REFERENCES roles/);
++  assert.match(schema, /FOREIGN KEY \(user_id\) REFERENCES users/);
++  assert.match(schema, /FOREIGN KEY \(list_id\) REFERENCES shopping_lists/);
++  assert.match(schema, /FOREIGN KEY \(product_id\) REFERENCES products/);
++  assert.match(schema, /uq_source_product_url/);
++  assert.match(schema, /comparison_key VARCHAR\(255\)/);
++});
+diff --git a/utils/generateTokken.js b/utils/generateTokken.js
+index af5444a..580c5ae 100644
+--- a/utils/generateTokken.js
++++ b/utils/generateTokken.js
+@@ -1,34 +1,36 @@
+-import jwt from "jsonwebtoken";
+ import dotenv from "dotenv";
++import jwt from "jsonwebtoken";
+ 
+ dotenv.config();
+ 
+-class GenerateTokens {
+-    generateAccessToken(user) {
+-        const accessToken = jwt.sign(
+-            {
+-                id: user.user_id,
+-                email: user.user_email,
+-                role: user.role_name,
+-            },
+-            process.env.ACCESS_TOKEN_SECRET,
+-            { expiresIn: "15m" },
+-        );
+-
+-        return accessToken;
+-    }
++function requiredSecret(name) {
++  const secret = process.env[name];
++  if (!secret) {
++    throw new Error(`${name} não configurado`);
++  }
++  return secret;
++}
+ 
+-    generateRefreshToken(user) {
+-        const refreshToken = jwt.sign(
+-            {
+-                id: user.user_id,
+-            },
+-            process.env.REFRESH_TOKEN_SECRET,
+-            { expiresIn: "7d" },
+-        );
++class GenerateTokens {
++  generateAccessToken(user) {
++    return jwt.sign(
++      {
++        id: user.user_id,
++        email: user.user_email,
++        role: user.role_name ?? user.role_id ?? "user",
++      },
++      requiredSecret("ACCESS_TOKEN_SECRET"),
++      { expiresIn: process.env.ACCESS_TOKEN_EXPIRES_IN || "15m" },
++    );
++  }
+ 
+-        return refreshToken;
+-    }
++  generateRefreshToken(user) {
++    return jwt.sign(
++      { id: user.user_id },
++      requiredSecret("REFRESH_TOKEN_SECRET"),
++      { expiresIn: process.env.REFRESH_TOKEN_EXPIRES_IN || "7d" },
++    );
++  }
+ }
+ 
+-export default new GenerateTokens();
+\ No newline at end of file
++export default new GenerateTokens();

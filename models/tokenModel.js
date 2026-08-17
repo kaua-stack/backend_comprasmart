@@ -1,23 +1,34 @@
 import pool from "../db/database.js";
 
-
-class TokkenModel{
-    async createToken(tokenData){
-        const {token, user_id, expires_at} = tokenData;
-        const [result] = await pool.execute("INSERT INTO tokens ( token, expires_at, user_id) VALUES (?,?,?);",[token, expires_at, user_id]);
-        return result;
+class TokenModel {
+  async createToken({ token, user_id, expires_at }) {
+    if (!token || !user_id || !expires_at) {
+      throw new Error("Dados incompletos para criar token");
     }
 
-    async selectByToken(token){
-        const [result] = await pool.execute("select * from tokens where token =?;",[token]);
-        return result;
-    }
+    const [result] = await pool.execute(
+      "INSERT INTO tokens (token, expires_at, user_id) VALUES (?, ?, ?)",
+      [token, expires_at, user_id],
+    );
+    return result;
+  }
 
-    async deleteToken(token){
-        const [result] = await pool.execute("delete from tokens where token=?;",[token]);
-        return result;
-    }
+  async selectByToken(token) {
+    if (!token) return [];
 
+    const [rows] = await pool.execute(
+      "SELECT token, user_id, expires_at FROM tokens WHERE token = ? LIMIT 1",
+      [token],
+    );
+    return rows;
+  }
+
+  async deleteToken(token) {
+    if (!token) return { affectedRows: 0 };
+
+    const [result] = await pool.execute("DELETE FROM tokens WHERE token = ?", [token]);
+    return result;
+  }
 }
 
-export default new TokkenModel()
+export default new TokenModel();

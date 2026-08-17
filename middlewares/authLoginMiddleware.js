@@ -1,53 +1,40 @@
 import dotenv from "dotenv";
 import jwt from "jsonwebtoken";
 
-dotenv.config()
+dotenv.config();
 
+export function authenticationToken(req, res, next) {
+  const authorization = req.headers.authorization;
+  const [scheme, token] = authorization?.split(" ") || [];
 
-// posso exportar como default colocando o export ao criar a constant ou classe
-export const authenticationToken = (req, res, next) => {
+  if (scheme?.toLowerCase() !== "bearer" || !token) {
+    return res.status(401).json({ error: "Token Bearer não fornecido" });
+  }
 
-    const getToken = req.headers.authorization;
-    
-    if(!getToken){
-
-        return res.status(401).json({
-            error:" token nao fornecido!"
-        });
+  try {
+    req.user = jwt.verify(token, process.env.ACCESS_TOKEN_SECRET);
+    return next();
+  } catch (error) {
+    if (error.name === "TokenExpiredError") {
+      return res.status(401).json({ error: "Token expirado" });
     }
 
-
-    const bearerTokken = getToken.split(" ")[1];
-    if (!bearerTokken) {
-        return res.status(401).json({ error: "Token não fornecido" })
-    }
-
-
-    //
-    jwt.verify(bearerTokken, process.env.ACCESS_TOKEN_SECRET, (error, user) => {
-        if (error) {
-            return res.status(403).json({ error: "Token inválido!" })
-        }
-
-        req.user = user
-
-        next()
-    });
-};
-
-export const adminRole = (...allowedRoles) => {
-
-    return (req, res, next) => {
-        if (!req.user) {
-            return res.status(401).json({ error: "Usuário não autenticado" });
-        }
-
-        if (!allowedRoles.includes(req.user.role)) {
-            return res.status(403).json({ error: "Acesso negado. Função não autorizada." });
-        }
-        next();
-
-    }
+    return res.status(403).json({ error: "Token inválido" });
+  }
 }
 
-export default { authenticationToken, adminRole }
+export function adminRole(...allowedRoles) {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ error: "Usuário não autenticado" });
+    }
+
+    if (!allowedRoles.map(String).includes(String(req.user.role))) {
+      return res.status(403).json({ error: "Acesso negado. Função não autorizada" });
+    }
+
+    return next();
+  };
+}
+
+export default { authenticationToken, adminRole };

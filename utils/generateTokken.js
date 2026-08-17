@@ -1,34 +1,36 @@
-import jwt from "jsonwebtoken";
 import dotenv from "dotenv";
+import jwt from "jsonwebtoken";
 
 dotenv.config();
 
+function requiredSecret(name) {
+  const secret = process.env[name];
+  if (!secret) {
+    throw new Error(`${name} não configurado`);
+  }
+  return secret;
+}
+
 class GenerateTokens {
-    generateAccessToken(user) {
-        const accessToken = jwt.sign(
-            {
-                id: user.user_id,
-                email: user.user_email,
-                role: user.role_name,
-            },
-            process.env.ACCESS_TOKEN_SECRET,
-            { expiresIn: "15m" },
-        );
+  generateAccessToken(user) {
+    return jwt.sign(
+      {
+        id: user.user_id,
+        email: user.user_email,
+        role: user.role_name ?? user.role_id ?? "user",
+      },
+      requiredSecret("ACCESS_TOKEN_SECRET"),
+      { expiresIn: process.env.ACCESS_TOKEN_EXPIRES_IN || "15m" },
+    );
+  }
 
-        return accessToken;
-    }
-
-    generateRefreshToken(user) {
-        const refreshToken = jwt.sign(
-            {
-                id: user.user_id,
-            },
-            process.env.REFRESH_TOKEN_SECRET,
-            { expiresIn: "7d" },
-        );
-
-        return refreshToken;
-    }
+  generateRefreshToken(user) {
+    return jwt.sign(
+      { id: user.user_id },
+      requiredSecret("REFRESH_TOKEN_SECRET"),
+      { expiresIn: process.env.REFRESH_TOKEN_EXPIRES_IN || "7d" },
+    );
+  }
 }
 
 export default new GenerateTokens();
