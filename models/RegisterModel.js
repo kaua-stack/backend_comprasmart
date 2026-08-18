@@ -1,31 +1,60 @@
 import pool from "../db/database.js";
 
-const USER_FIELDS = `
+const USER_FIELDS_WITH_ROLE = `
   u.user_id,
   u.user_name,
   u.user_email,
   u.user_password,
   u.role_id,
   u.user_status,
-  u.user_google_id,
   COALESCE(r.role_name, CAST(u.role_id AS CHAR)) AS role_name
 `;
 
-const FALLBACK_USER_FIELDS = `
-  user_id,
-  user_name,
-  user_email,
-  user_password,
-  role_id,
-  user_status,
-  user_google_id,
-  CAST(role_id AS CHAR) AS role_name
+const CORE_USER_FIELDS = `
+  u.user_id,
+  u.user_name,
+  u.user_email,
+  u.user_password,
+  u.role_id,
+  u.user_status,
+  CAST(u.role_id AS CHAR) AS role_name
 `;
 
-async function executeUserQuery(where = "", params = [], options = {}) {
+const LEGACY_USER_FIELDS = `
+  u.user_id,
+  u.user_name,
+  u.user_email,
+  u.user_password,
+  1 AS role_id,
+  1 AS user_status,
+  'user' AS role_name
+`;
+
+const DEFAULT_USER_ROLE_ID = 2;
+
+const OPTIONAL_SCHEMA_ERRORS = new Set([
+  "ER_BAD_FIELD_ERROR",
+  "ER_NO_SUCH_TABLE",
+  "ER_NO_SUCH_COLUMN",
+]);
+
+function isOptionalSchemaError(error) {
+  return OPTIONAL_SCHEMA_ERRORS.has(error?.code);
+}
+
+async function executeUserQuery(where = "", params = [], schema = "with-role") {
+  const fields = schema === "with-role"
+    ? USER_FIELDS_WITH_ROLE
+    : schema === "core"
+      ? CORE_USER_FIELDS
+      : LEGACY_USER_FIELDS;
+  const from = schema === "with-role"
+    ? "users u LEFT JOIN roles r ON r.role_id = u.role_id"
+    : "users u";
+
   const query = `
-    SELECT ${options.fallback ? FALLBACK_USER_FIELDS : USER_FIELDS}
-    FROM ${options.fallback ? "users" : "users u LEFT JOIN roles r ON r.role_id = u.role_id"}
+    SELECT ${fields}
+    FROM ${from}
     ${where}
   `;
 
@@ -34,12 +63,31 @@ async function executeUserQuery(where = "", params = [], options = {}) {
 
 async function selectUsers(where = "", params = []) {
   try {
-    return await executeUserQuery(where, params);
+    return await executeUserQuery(where, params, "with-role");
   } catch (error) {
-    // Permite o funcionamento em bancos que ainda não possuem a tabela roles.
-    if (["ER_NO_SUCH_TABLE", "ER_BAD_FIELD_ERROR"].includes(error.code)) {
-      return executeUserQuery(where.replaceAll("u.", ""), params, { fallback: true });
+    if (!isOptionalSchemaError(error)) throw error;
+
+    try {
+      return await executeUserQuery(where, params, "core");
+    } catch (coreError) {
+      // Bancos criados antes do patch podem ter somente as três colunas básicas.
+      if (isOptionalSchemaError(coreError)) {
+        return executeUserQuery(where, params, "legacy");
+      }
+      throw coreError;
     }
+  }
+}
+
+async function findDefaultUserRoleId() {
+  try {
+    const [rows] = await pool.execute(
+      "SELECT role_id FROM roles WHERE LOWER(role_name) = 'user' LIMIT 1",
+    );
+    return rows[0]?.role_id ?? null;
+  } catch (error) {
+    // O cadastro normal não deve depender da tabela opcional de roles.
+    if (isOptionalSchemaError(error)) return null;
     throw error;
   }
 }
@@ -69,15 +117,44 @@ const userModel = {
   },
 
   async selectUserByGoogleId(googleId) {
-    return selectUsers("WHERE u.user_google_id = ? LIMIT 1", [googleId]).then(([rows]) => rows);
+    try {
+      const [rows] = await pool.execute(
+        `SELECT ${CORE_USER_FIELDS}, u.user_google_id
+         FROM users u
+         WHERE u.user_google_id = ?
+         LIMIT 1`,
+        [googleId],
+      );
+      return rows;
+    } catch (error) {
+      // Login por e-mail continua funcional em schemas sem suporte ao Google.
+      if (isOptionalSchemaError(error)) return [];
+      throw error;
+    }
   },
 
-  async insertUser({ user_name, user_email, user_password, role_id = 1, user_status = 1 }) {
+  async insertUser({ user_name, user_email, user_password, role_id = null, user_status = 1 }) {
+    const defaultRoleId = role_id ?? (await findDefaultUserRoleId()) ?? DEFAULT_USER_ROLE_ID;
+
+    if (defaultRoleId !== null) {
+      try {
+        const [result] = await pool.execute(
+          `INSERT INTO users
+            (user_name, user_email, user_password, role_id, user_status)
+           VALUES (?, ?, ?, ?, ?)`,
+          [user_name, user_email, user_password, defaultRoleId, user_status],
+        );
+        return result;
+      } catch (error) {
+        // Continua para o INSERT mínimo quando o banco ainda é legado.
+        if (!isOptionalSchemaError(error)) throw error;
+      }
+    }
+
     const [result] = await pool.execute(
-      `INSERT INTO users
-        (user_name, user_email, user_password, role_id, user_status)
-       VALUES (?, ?, ?, ?, ?)`,
-      [user_name, user_email, user_password, role_id, user_status],
+      `INSERT INTO users (user_name, user_email, user_password)
+       VALUES (?, ?, ?)`,
+      [user_name, user_email, user_password],
     );
     return result;
   },
@@ -86,14 +163,21 @@ const userModel = {
     user_name,
     user_email,
     user_google_id,
-    role_id = 1,
+    role_id = null,
     user_status = 1,
   }) {
+    const defaultRoleId = role_id ?? (await findDefaultUserRoleId()) ?? DEFAULT_USER_ROLE_ID;
+    if (defaultRoleId === null) {
+      throw Object.assign(new Error("Login Google exige o schema completo de usuários"), {
+        code: "GOOGLE_SCHEMA_NOT_CONFIGURED",
+      });
+    }
+
     const [result] = await pool.execute(
       `INSERT INTO users
         (user_name, user_email, user_google_id, role_id, user_status)
        VALUES (?, ?, ?, ?, ?)`,
-      [user_name, user_email, user_google_id, role_id, user_status],
+      [user_name, user_email, user_google_id, defaultRoleId, user_status],
     );
     return result;
   },
