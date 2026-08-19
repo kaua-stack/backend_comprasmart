@@ -5,6 +5,8 @@ import dotenv from "dotenv";
 
 import userRoute from "./routes/RegisterRouter.js";
 import loginRoute from "./routes/LoginRoutes.js";
+import shoppingRoute from "./routes/ShoppingRoutes.js";
+import profileRoute from "./routes/ProfileRoutes.js";
 
 dotenv.config();
 
@@ -54,6 +56,8 @@ app.get("/health", (_req, res) => {
 
 app.use("/user", userRoute);
 app.use(loginRoute);
+app.use("/api", shoppingRoute);
+app.use("/users", profileRoute);
 
 app.use((error, _req, res, _next) => {
   if (error?.message?.startsWith("Origem não autorizada pelo CORS:")) {
