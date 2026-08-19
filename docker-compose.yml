@@ -1,0 +1,133 @@
+name: comprasmart
+
+services:
+  db:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-comprasmart}
+      MYSQL_USER: ${MYSQL_USER:-comprasmart_app}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-comprasmart_app_password}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_password_change_me}
+    ports:
+      - "${MYSQL_HOST_PORT:-3307}:3306"
+    volumes:
+      - comprasmart_db_data:/var/lib/mysql
+      - ${BACKEND_CONTEXT:-./backend_comprasmart}/sql/comprasmart.sql:/docker-entrypoint-initdb.d/001-comprasmart.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - comprasmart_net
+
+  market-db:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: ${MARKET_MYSQL_DATABASE:-mercado_scraper}
+      MYSQL_USER: ${MARKET_MYSQL_USER:-market_app}
+      MYSQL_PASSWORD: ${MARKET_MYSQL_PASSWORD:-market_app_password}
+      MYSQL_ROOT_PASSWORD: ${MARKET_MYSQL_ROOT_PASSWORD:-market_root_password_change_me}
+    ports:
+      - "${MARKET_MYSQL_HOST_PORT:-3308}:3306"
+    volumes:
+      - mercado_scraper_db_data:/var/lib/mysql
+      - ${SCRAPER_CONTEXT:-./mercado_scraper}/sql/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - comprasmart_net
+
+  backend:
+    build:
+      context: ${BACKEND_CONTEXT:-./backend_comprasmart}
+      dockerfile: Dockerfile
+    environment:
+      NODE_ENV: production
+      PORT_SERVER: 3000
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_USER: ${MYSQL_USER:-comprasmart_app}
+      DB_PASSWORD: ${MYSQL_PASSWORD:-comprasmart_app_password}
+      DB_NAME: ${MYSQL_DATABASE:-comprasmart}
+      MARKET_DB_HOST: market-db
+      MARKET_DB_PORT: 3306
+      MARKET_DB_USER: ${MARKET_MYSQL_USER:-market_app}
+      MARKET_DB_PASSWORD: ${MARKET_MYSQL_PASSWORD:-market_app_password}
+      MARKET_DB_NAME: ${MARKET_MYSQL_DATABASE:-mercado_scraper}
+      ACCESS_TOKEN_SECRET: ${ACCESS_TOKEN_SECRET:-change_this_access_secret_in_production}
+      REFRESH_TOKEN_SECRET: ${REFRESH_TOKEN_SECRET:-change_this_refresh_secret_in_production}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      COOKIE_SAMESITE: ${COOKIE_SAMESITE:-lax}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+    ports:
+      - "${BACKEND_HOST_PORT:-3000}:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+      market-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    networks:
+      - comprasmart_net
+
+  frontend:
+    build:
+      context: ${FRONTEND_CONTEXT:-./frontend_CompraSmart}
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:3000}
+    ports:
+      - "${FRONTEND_HOST_PORT:-8080}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - comprasmart_net
+
+  scraper:
+    build:
+      context: ${SCRAPER_CONTEXT:-./mercado_scraper}
+      dockerfile: Dockerfile
+    profiles: ["collector"]
+    environment:
+      DB_HOST: market-db
+      DB_PORT: 3306
+      DB_NAME: ${MARKET_MYSQL_DATABASE:-mercado_scraper}
+      DB_USER: ${MARKET_MYSQL_USER:-market_app}
+      DB_PASSWORD: ${MARKET_MYSQL_PASSWORD:-market_app_password}
+      HEADLESS: ${SCRAPER_HEADLESS:-true}
+      REQUEST_DELAY_MS: ${SCRAPER_REQUEST_DELAY_MS:-1200}
+      MAX_CONCURRENCY: ${SCRAPER_MAX_CONCURRENCY:-2}
+      MAX_PAGES_PER_SOURCE: ${SCRAPER_MAX_PAGES_PER_SOURCE:-500}
+      SAVE_PRICE_HISTORY: ${SCRAPER_SAVE_PRICE_HISTORY:-true}
+    depends_on:
+      market-db:
+        condition: service_healthy
+    networks:
+      - comprasmart_net
+
+volumes:
+  comprasmart_db_data:
+  mercado_scraper_db_data:
+
+networks:
+  comprasmart_net:
+    driver: bridge
